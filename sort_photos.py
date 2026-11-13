@@ -64,6 +64,7 @@ try:  # HEIC/HEIF support (iPhone photos)
 except ImportError:
     pass
 
+TRASH_DIR = ".photo-sorter-trash"  # photos deleted in the web interface are moved here, never scanned
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tif", ".tiff", ".webp"}
 MONTH_NAMES = [
     "January", "February", "March", "April", "May", "June",
@@ -122,6 +123,7 @@ FACE_SCHEMA = [
         model     TEXT NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS idx_faces_photo ON faces(photo_id)",
+    "CREATE INDEX IF NOT EXISTS idx_photos_taken ON photos(taken_at)",  # phase 5: browsing by date
     # Phase 3: people. A person is just a group of faces the AI thinks belong together.
     # name stays NULL until you name the group in the web UI (phase 4).
     """CREATE TABLE IF NOT EXISTS persons (
@@ -287,6 +289,7 @@ def iter_photos(source: Path, exclude: Path | None = None, onerror=None):
     """Yield image files under source, optionally skipping one folder."""
     for root, dirs, files in os.walk(source, onerror=onerror):
         root_path = Path(root)
+        dirs[:] = [d for d in dirs if d != TRASH_DIR]
         if exclude is not None:
             dirs[:] = [d for d in dirs if (root_path / d).resolve() != exclude]
         for name in sorted(files):

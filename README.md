@@ -218,6 +218,39 @@ Privacy and safety:
   trust everyone on that network.
 - `--port` changes the port (default 8765), `--no-browser` stops it opening a browser tab.
 
+### Phase 5: browse the whole library (the **Photos** page)
+
+The first item in the left menu shows every photo in the index, newest first, grouped by month.
+
+- **People quick links:** every person you have named appears as a chip with their photo count. Click one to see only
+  their photos; click several to narrow further. With two or more selected you choose *In the same photo* (default) or
+  *Any of them*. *Include matches the AI is unsure about* adds faces still waiting in the Review queue.
+- **Quick filters:** *Unlabeled faces* (photos with a face nobody has named), *Needs review*, *No faces*, and *Not scanned
+  yet* (run `faces --apply` to scan them). A filter is hidden when nothing matches it.
+- **Narrow by** year and month, file or folder name, and newest/oldest first.
+- **Open a photo** to see it large with a box around each face. Named faces are labelled and clickable ("Show their
+  photos"); the side panel lists who is in the photo, where the file lives and when it was taken. Use the arrow keys or
+  the Previous / Next buttons to move through the current results, **Esc** to close.
+- The address bar holds the filters (for example `#/photos?person=3&year=2019`), so you can bookmark a view. A person's
+  page has a **View photos of ...** button.
+
+**Select several photos.** Tick the circle in a photo's corner (Shift-click ticks a range). Once anything is ticked, clicking
+a photo ticks it instead of opening it. A bar at the bottom offers *Select all shown*, *Clear* (or press Esc) and
+**Delete N photos**, which asks for confirmation with a preview of what you chose, up to 500 at a time. Deleted photos are
+handled one by one, so a problem with one file doesn't stop the rest.
+
+**Rename and delete.** In the photo viewer, **Rename** and **Delete photo** each open a confirmation popup first.
+- *Rename* changes the file on your drive. It stays in the same folder and keeps its extension (type just the new name),
+  and it refuses names Windows doesn't allow or that already exist in that folder.
+- *Delete photo* does **not** erase the file. It moves it to a `.photo-sorter-trash` folder at the top of your library
+  (a note of each file's original location is added to `deleted.log` there) and removes the photo and its face matches from
+  the Photo sorter. Unnamed groups left with no faces are cleaned up. To restore a photo, move it back into its
+  Year\NN-mon folder and run `refresh`; to free the space, delete the trash folder yourself. `sort` and `refresh` ignore it.
+
+Thumbnails are made the first time you look at a photo and cached in a `thumbs` folder next to the index database
+(`%LOCALAPPDATA%\photo-sorter\thumbs`), so they are quick afterwards. The first screen of a large library on a network
+drive can take a little while to appear. Your original photos are only ever read. Deleting the `thumbs` folder is safe.
+
 ### The whole workflow
 
     python sort_photos.py sort SOURCE DEST --apply     # or: refresh DEST --apply for a library that is already sorted
@@ -230,4 +263,7 @@ Privacy and safety:
 - Phase 2: InsightFace detection + embeddings stored in SQLite (done)
 - Phase 3: clustering, with low-confidence faces flagged for review (done)
 - Phase 4: web interface to name people and work the review queue (done)
-- Ideas not built yet: searching photos by person, writing people's names into photo metadata or folders, an undo button
+- Phase 5: browse the whole library with people quick filters, rename and delete with confirmation (done)
+- Phases 6-8 (planned): a wider metadata store, search by typing a description, optional AI captions. The research and
+  design are in [docs/ROADMAP.md](docs/ROADMAP.md).
+- Ideas not built yet: writing people's names into photo metadata or folders, an undo button

@@ -189,6 +189,7 @@ function renderRail() {
   );
   rail.replaceChildren(
     h("div", { class: "brand", text: "Photo sorter" }),
+    link("#/photos", "Photos", s.photos),
     link("#/people", "People", s.people), link("#/review", "Review", s.review, true),
     link("#/unassigned", "Unassigned", s.unassigned), link("#/ignored", "Ignored", s.ignored),
     foot,
@@ -468,6 +469,7 @@ async function viewPerson(id) {
   main.replaceChildren(
     h("p", {}, h("a", { class: "back", href: "#/people", text: "← People" })),
     h("div", { class: "page-head" }, h("div", { style: "flex:1;min-width:260px" }, nameField(person, { big: true, onMerged: (into) => { location.hash = `#/people/${into}`; } }), meta),
+      h("a", { class: "btn", href: `#/photos?person=${id}`, text: `View photos of ${person.name || "this person"}` }),
       person.review ? h("a", { class: "btn", href: `#/review/${id}`, text: `${plural(person.review, "face")} to review` }) : null, mergeBtn),
     similar, h("div", { class: "toolbar" }, order), grid.el);
 
@@ -578,13 +580,387 @@ async function viewScope(scope) {
   if (token === renderToken) await grid.load(true).catch((e) => toast(e.message, "error"));
 }
 
+// ---------------------------------------------------------------- photos (browse the whole library)
+const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+
+function photosHash(f) {
+  const p = new URLSearchParams();
+  if (f.person.length) p.set("person", f.person.join(","));
+  if (f.person.length > 1 && f.match === "any") p.set("match", "any");
+  if (f.person.length && f.uncertain) p.set("uncertain", "1");
+  if (f.filter) p.set("filter", f.filter);
+  if (f.year) p.set("year", f.year);
+  if (f.year && f.month) p.set("month", f.month);
+  if (f.q) p.set("q", f.q);
+  if (f.order === "old") p.set("order", "old");
+  const text = p.toString();
+  return "#/photos" + (text ? "?" + text : "");
+}
+
+function monthHeading(taken) {
+  if (!taken) return "Undated";
+  const [year, month] = taken.split("-");
+  return `${MONTHS[Number(month) - 1] || ""} ${year}`.trim();
+}
+
+const photoSel = new Set();   // ids of photos ticked in the Photos view
+let lastPicked = null;
+
+function photoTile(photo) {
+  const names = photo.people.map((p) => p.name);
+  const who = names.length ? names.slice(0, 3).join(", ") + (names.length > 3 ? ` +${names.length - 3}` : "") : "";
+  const open = (e) => {
+    if (photoSel.size) togglePhoto(photo, e.shiftKey);
+    else openViewer(state.photoList.indexOf(photo));
+  };
+  return h("div", { class: "photo", "data-id": String(photo.id) },
+    h("button", { class: "pbody", type: "button", "aria-label": `${photo.name}, ${photo.taken || "undated"}`, onclick: open },
+      h("img", { src: `/api/photos/${photo.id}/thumb`, alt: "", loading: "lazy", onerror: (e) => e.target.closest(".photo").classList.add("is-missing") }),
+      h("span", { class: "pcap" },
+        h("span", { class: "who" + (who ? "" : " none"), text: who || (photo.faces ? "No one named yet" : photo.name) }),
+        h("span", { class: "when" }, photo.taken || "", photo.unlabeled > 0 && photo.faces ? h("span", { class: "flag", text: `  ${photo.unlabeled} unlabeled` }) : null))),
+    h("button", { class: "ptick", type: "button", "aria-pressed": "false", "aria-label": `Select ${photo.name}`, title: "Select (Shift-click selects a range)",
+      onclick: (e) => togglePhoto(photo, e.shiftKey) }));
+}
+
+function togglePhoto(photo, range) {
+  const list = state.photoList;
+  if (range && lastPicked != null) {
+    const from = list.findIndex((p) => p.id === lastPicked), to = list.indexOf(photo);
+    if (from >= 0 && to >= 0) for (let i = Math.min(from, to); i <= Math.max(from, to); i++) photoSel.add(list[i].id);
+  } else if (photoSel.has(photo.id)) photoSel.delete(photo.id);
+  else photoSel.add(photo.id);
+  lastPicked = photo.id;
+  syncPhotoTiles(); renderPhotoSelbar();
+}
+
+function syncPhotoTiles() {
+  const grid = document.querySelector(".photos");
+  if (grid) grid.classList.toggle("selecting", photoSel.size > 0);
+  for (const tile of document.querySelectorAll(".photos .photo")) {
+    const on = photoSel.has(Number(tile.dataset.id));
+    tile.classList.toggle("is-selected", on);
+    tile.querySelector(".ptick").setAttribute("aria-pressed", String(on));
+  }
+}
+
+function clearPhotoSelection() { photoSel.clear(); lastPicked = null; syncPhotoTiles(); renderPhotoSelbar(); }
+
+function renderPhotoSelbar() {
+  if (!photoSel.size) { selbar.hidden = true; return; }
+  selbar.hidden = false;
+  selbar.replaceChildren(
+    h("span", { class: "n", text: `${photoSel.size.toLocaleString()} selected` }),
+    h("button", { class: "btn quiet", type: "button", text: "Select all shown", onclick: () => { state.photoList.forEach((p) => photoSel.add(p.id)); syncPhotoTiles(); renderPhotoSelbar(); } }),
+    h("button", { class: "btn quiet", type: "button", text: "Clear", onclick: clearPhotoSelection }),
+    h("span", { class: "spacer" }),
+    h("button", { class: "btn danger", type: "button", text: photoSel.size === 1 ? "Delete photo" : `Delete ${photoSel.size.toLocaleString()} photos`, onclick: deleteSelectedPhotos }));
+}
+
+/** Drop photos from the list and the grid after they were deleted, without reloading the page. */
+function removePhotos(ids) {
+  const gone = new Set(ids);
+  state.photoList = state.photoList.filter((p) => !gone.has(p.id));
+  for (const tile of document.querySelectorAll(".photos .photo")) if (gone.has(Number(tile.dataset.id))) tile.remove();
+  for (const heading of document.querySelectorAll(".photos h2.month")) {
+    const next = heading.nextElementSibling;
+    if (!next || !next.classList.contains("photo")) heading.remove();
+  }
+  ids.forEach((id) => photoSel.delete(id));
+  if (state.onRemoved) state.onRemoved(ids.length);
+  refreshSummary().catch(() => {});
+  renderPhotoSelbar();
+}
+
+function deleteSelectedPhotos() {
+  const chosen = state.photoList.filter((p) => photoSel.has(p.id));
+  if (!chosen.length) return;
+  const n = chosen.length;
+  const label = n === 1 ? "photo" : `${n.toLocaleString()} photos`;
+  const cancel = h("button", { class: "btn", type: "button", text: "Cancel" });
+  const ok = h("button", { class: "btn danger", type: "button", text: n === 1 ? "Delete photo" : `Delete ${n.toLocaleString()} photos` });
+  const dialog = openDialog(h("div", { class: "dlg" },
+    h("h2", { text: `Delete ${label}?` }),
+    h("div", { class: "thumbs" },
+      ...chosen.slice(0, 8).map((p) => h("img", { src: `/api/photos/${p.id}/thumb`, alt: p.name, title: p.name })),
+      n > 8 ? h("span", { class: "more", text: `+${(n - 8).toLocaleString()} more` }) : null),
+    h("p", { text: `${n === 1 ? chosen[0].name + " will" : label + " will"} be moved to the ${TRASH_FOLDER} folder in your library and removed from the Photo sorter, along with their face matches. Nothing is erased from your drive, so you can move them back yourself.` }),
+    h("div", { class: "row" }, cancel, ok)));
+  cancel.addEventListener("click", () => dialog.close());
+  ok.addEventListener("click", async () => {
+    ok.disabled = cancel.disabled = true; ok.textContent = "Deleting…";
+    try {
+      const result = await api("/api/photos/delete", { body: { photo_ids: chosen.map((p) => p.id) } });
+      dialog.close();
+      removePhotos(result.deleted);
+      if (result.failed.length) toast(`${plural(result.deleted.length, "photo")} deleted. ${result.failed.length} could not be deleted: ${result.failed[0].error}`, "error");
+      else toast(`Deleted ${plural(result.deleted.length, "photo")}`);
+    } catch (e) { dialog.close(); toast(e.message, "error"); }
+  });
+  cancel.focus();
+}
+
+async function viewPhotos(params) {
+  const token = ++renderToken;
+  const f = {
+    person: (params.get("person") || "").split(",").filter(Boolean).map(Number),
+    match: params.get("match") === "any" ? "any" : "all",
+    uncertain: params.get("uncertain") === "1",
+    filter: params.get("filter") || "", year: params.get("year") || "", month: params.get("month") || "",
+    q: params.get("q") || "", order: params.get("order") === "old" ? "old" : "new",
+  };
+  const go = (changes) => { location.hash = photosHash({ ...f, ...changes }); };
+  const filtered = f.person.length || f.filter || f.year || f.q;
+
+  let lib, chips;
+  try { [lib, chips] = await Promise.all([api("/api/library"), api("/api/people/chips")]); }
+  catch (e) { main.replaceChildren(h("div", { class: "empty" }, h("h2", { text: "Couldn't load the library" }), h("p", { text: e.message }))); return; }
+  if (token !== renderToken) return;
+
+  // quick filters
+  const quick = [["", "All photos", lib.total], ["unlabeled", "Unlabeled faces", lib.counts.unlabeled], ["review", "Needs review", lib.counts.review],
+    ["noface", "No faces", lib.counts.noface], ["unscanned", "Not scanned yet", lib.counts.unscanned]]
+    .filter(([value, , count]) => value === "" || value === f.filter || count > 0);
+  const seg = h("div", { class: "seg", role: "group", "aria-label": "Quick filters" }, ...quick.map(([value, label, count]) =>
+    h("button", { type: "button", "aria-pressed": String(f.filter === value), onclick: () => go({ filter: value }) }, label, " ", h("span", { class: "count", text: count.toLocaleString() }))));
+
+  // people chips: the most photographed named people, plus anyone selected
+  const shown = chips.people.slice(0, 24);
+  const known = new Map(chips.people.map((p) => [p.id, p]));
+  for (const id of f.person) {
+    if (!known.has(id)) {
+      const extra = await api(`/api/people/${id}`).catch(() => null);
+      if (extra) { const chip = { id, name: extra.name, photos: null, sample: extra.samples[0] }; known.set(id, chip); shown.push(chip); }
+    } else if (!shown.includes(known.get(id))) shown.push(known.get(id));
+  }
+  const chipButton = (p) => {
+    const on = f.person.includes(p.id);
+    return h("button", { class: "chip", type: "button", "aria-pressed": String(on), title: on ? "Remove from the filter" : "Show photos with this person",
+      onclick: () => go({ person: on ? f.person.filter((x) => x !== p.id) : [...f.person, p.id] }) },
+      p.sample ? h("img", { src: thumb(p.sample), alt: "" }) : h("span", { class: "dot" }),
+      h("span", { class: "n", text: p.name || "Unnamed person" }), p.photos != null ? h("span", { class: "count", text: p.photos.toLocaleString() }) : null);
+  };
+  const peopleRow = h("div", { class: "chips", role: "group", "aria-label": "People" },
+    ...shown.map(chipButton),
+    chips.people.length > 24 ? h("button", { class: "btn quiet", type: "button", text: "Find someone…", onclick: () => openPicker({ title: "Filter by person", onPick: ({ person }) => go({ person: [...new Set([...f.person, person.id])] }) }) }) : null,
+    !chips.people.length ? h("span", { class: "count", text: chips.unnamed_groups ? "Name people on the People page and they appear here as quick links." : "No people found yet." }) : null);
+
+  const options = [];
+  if (f.person.length > 1) {
+    options.push(h("div", { class: "seg", role: "group", "aria-label": "Match" },
+      ...[["all", "In the same photo"], ["any", "Any of them"]].map(([value, label]) => h("button", { type: "button", "aria-pressed": String(f.match === value), onclick: () => go({ match: value }) }, label))));
+  }
+  if (f.person.length) {
+    const box = h("input", { type: "checkbox", checked: f.uncertain, onchange: () => go({ uncertain: box.checked }) });
+    options.push(h("label", { class: "check" }, box, " Include matches the AI is unsure about"));
+  }
+
+  // date, search, order
+  const yearSel = h("select", { class: "field", "aria-label": "Year", onchange: (e) => go({ year: e.target.value, month: "" }) },
+    h("option", { value: "", text: "All years" }),
+    ...lib.years.map((y) => h("option", { value: y.year, selected: f.year === y.year, text: `${y.year} (${y.count.toLocaleString()})` })));
+  const months = (lib.years.find((y) => y.year === f.year) || { months: [] }).months;
+  const monthSel = h("select", { class: "field", "aria-label": "Month", disabled: !f.year, onchange: (e) => go({ month: e.target.value }) },
+    h("option", { value: "", text: "All months" }),
+    ...months.slice().sort((a, b) => a.month.localeCompare(b.month)).map((m) => h("option", { value: m.month, selected: f.month === m.month, text: `${MONTHS[Number(m.month) - 1] || m.month} (${m.count.toLocaleString()})` })));
+  const search = h("input", { class: "field", type: "search", value: f.q, placeholder: "File or folder name", "aria-label": "Search file or folder names", onchange: (e) => go({ q: e.target.value.trim() }) });
+  const orderSel = h("select", { class: "field", "aria-label": "Order", onchange: (e) => go({ order: e.target.value }) },
+    h("option", { value: "new", text: "Newest first", selected: f.order === "new" }), h("option", { value: "old", text: "Oldest first", selected: f.order === "old" }));
+
+  const total = h("span", { class: "count" });
+  const grid = h("div", { class: "photos" });
+  const more = h("button", { class: "btn", type: "button", text: "Show more", hidden: true });
+  const empty = h("div", { class: "empty", hidden: true });
+  main.replaceChildren(...[
+    head("Photos", "Everything in your library, newest first. Pick people to see the photos they are in. Tick photos to delete several at once.", total),
+    h("div", { class: "toolbar" }, seg),
+    peopleRow, options.length ? h("div", { class: "toolbar", style: "margin-top:12px" }, ...options) : null,
+    h("div", { class: "toolbar", style: "margin-top:14px" }, yearSel, monthSel, search, orderSel,
+      filtered ? h("button", { class: "btn quiet", type: "button", text: "Clear filters", onclick: () => { location.hash = "#/photos"; } }) : null),
+    grid, h("p", {}, more), empty].filter(Boolean));
+
+  state.actions = null; renderSelbar();
+  state.photoList = [];
+  photoSel.clear(); lastPicked = null;
+  let offset = 0;
+  let shownTotal = 0;
+  let lastMonth = null;
+  async function load() {
+    const query = new URLSearchParams({ person: f.person.join(","), match: f.match, uncertain: String(f.uncertain), filter: f.filter, year: f.year, month: f.month, q: f.q, order: f.order, limit: 96, offset });
+    const data = await api(`/api/photos?${query}`);
+    if (token !== renderToken) return 0;
+    for (const photo of data.photos) {
+      const key = (photo.taken || "").slice(0, 7);
+      if (key !== lastMonth) { lastMonth = key; grid.append(h("h2", { class: "month", text: monthHeading(photo.taken) })); }
+      state.photoList.push(photo);
+      grid.append(photoTile(photo));
+    }
+    offset += data.photos.length;
+    more.hidden = offset >= data.total;
+    shownTotal = data.total;
+    total.textContent = plural(data.total, "photo");
+    empty.hidden = data.total > 0;
+    if (!data.total) {
+      empty.replaceChildren(...(filtered
+        ? [h("h2", { text: "No photos match" }), h("p", { text: "Try removing a filter. With several people selected, photos must contain all of them unless you choose Any of them." })]
+        : [h("h2", { text: "No photos in the index yet" }), h("p", {}, "Run ", h("code", { text: "python sort_photos.py sort SOURCE DEST --apply" }), " or ", h("code", { text: "refresh DEST --apply" }), " first.")]));
+    }
+    return data.photos.length;
+  }
+  state.onRemoved = (n = 1) => { offset -= n; shownTotal -= n; total.textContent = plural(shownTotal, "photo"); empty.hidden = shownTotal > 0; if (!shownTotal) empty.replaceChildren(h("h2", { text: "No photos left here" })); };
+  state.loadMorePhotos = async () => (more.hidden ? 0 : load());
+  more.addEventListener("click", () => load().catch((e) => toast(e.message, "error")));
+  state.reload = () => viewPhotos(params);
+  await load().catch((e) => toast(e.message, "error"));
+}
+
+const TRASH_FOLDER = ".photo-sorter-trash";
+let viewerToken = 0;
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && photoSel.size && !document.querySelector("dialog[open]")) clearPhotoSelection();
+});
+async function openViewer(start) {
+  let index = start;
+  let imageUrl = null;
+  const frame = h("div", { class: "stage" });
+  const side = h("div", { class: "vside" });
+  const position = h("span", { class: "count" });
+  const prev = h("button", { class: "btn", type: "button", text: "← Previous", onclick: () => step(-1) });
+  const next = h("button", { class: "btn", type: "button", text: "Next →", onclick: () => step(1) });
+  const close = h("button", { class: "btn", type: "button", text: "Close", onclick: () => dialog.close() });
+  const dialog = openDialog(h("div", { class: "viewer" }, frame, side,
+    h("div", { class: "vbar" }, prev, next, position, h("span", { class: "spacer" }), close)), { wide: true,
+    onClose: () => { document.removeEventListener("keydown", onKey); if (imageUrl) URL.revokeObjectURL(imageUrl); } });
+  dialog.classList.add("viewer-dialog");
+  // listen on the document: focus falls back to <body> whenever the photo is swapped
+  const onKey = (e) => {
+    if (e.target && /^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName)) return;
+    if (document.querySelectorAll("dialog[open]").length > 1) return;   // a confirmation is open on top
+    if (e.key === "ArrowLeft") step(-1); else if (e.key === "ArrowRight") step(1);
+  };
+  document.addEventListener("keydown", onKey);
+
+  async function step(delta) {
+    const target = index + delta;
+    if (target < 0) return;
+    if (target >= state.photoList.length) { if (!(state.loadMorePhotos && await state.loadMorePhotos()) || target >= state.photoList.length) return; }
+    show(target);
+  }
+
+  function renamePhoto(photo, detail) {
+    const dot = detail.name.lastIndexOf(".");
+    const ext = dot > 0 ? detail.name.slice(dot) : "";
+    const stem = dot > 0 ? detail.name.slice(0, dot) : detail.name;
+    const input = h("input", { class: "field", type: "text", value: stem, "aria-label": "New file name", maxlength: "150", spellcheck: "false" });
+    const preview = h("p", { class: "count" });
+    const problem = h("p", { class: "err", hidden: true });
+    const ok = h("button", { class: "btn primary", type: "button", text: "Rename" });
+    const cancel = h("button", { class: "btn", type: "button", text: "Cancel" });
+    const typed = () => { const t = input.value.trim(); return t.toLowerCase().endsWith(ext.toLowerCase()) && ext ? t : t + ext; };
+    const refresh = () => { preview.replaceChildren("Will be saved as ", h("strong", { text: typed() })); problem.hidden = true; ok.disabled = !input.value.trim(); };
+    input.addEventListener("input", refresh); refresh();
+    const confirm = openDialog(h("div", { class: "dlg" },
+      h("h2", { text: "Rename this photo?" }),
+      h("p", {}, "The file on your drive is renamed. It stays in the same folder and keeps its ", h("strong", { text: ext || "type" }), " ending."),
+      h("p", { class: "count" }, "Now: ", detail.name), input, preview, problem,
+      h("div", { class: "row" }, cancel, ok)));
+    const submit = async () => {
+      if (ok.disabled) return;
+      ok.disabled = true;
+      try {
+        const done = await api(`/api/photos/${photo.id}/rename`, { body: { name: input.value } });
+        confirm.close();
+        photo.name = done.name;
+        const tile = document.querySelectorAll(".photos .photo")[index];
+        if (tile && !photo.faces) { const who = tile.querySelector(".who"); if (who) who.textContent = done.name; }
+        if (tile) tile.setAttribute("aria-label", `${done.name}, ${photo.taken || "undated"}`);
+        toast(done.changed ? `Renamed to ${done.name}` : "The name was not changed");
+        show(index);
+      } catch (e) { problem.textContent = e.message; problem.hidden = false; ok.disabled = false; input.focus(); }
+    };
+    ok.addEventListener("click", submit);
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submit(); } });
+    cancel.addEventListener("click", () => confirm.close());
+    input.focus(); input.select();
+  }
+
+  async function deletePhoto(photo, detail) {
+    const yes = await ask({
+      title: "Delete this photo?",
+      text: `${detail.name} will be moved to the ${TRASH_FOLDER} folder in your library and removed from the Photo sorter, along with its face matches. It is not erased from your drive, so you can move it back yourself.`,
+      confirmLabel: "Delete photo", danger: true });
+    if (!yes) return;
+    try { await api(`/api/photos/${photo.id}/delete`, { body: {} }); }
+    catch (e) { toast(e.message, "error"); return; }
+    removePhotos([photo.id]);
+    toast(`Deleted ${detail.name}`);
+    if (!state.photoList.length) { dialog.close(); return; }
+    show(Math.min(index, state.photoList.length - 1));
+  }
+
+  async function show(n) {
+    index = n;
+    const mine = ++viewerToken;
+    const photo = state.photoList[index];
+    position.textContent = `${index + 1} of ${state.photoList.length}`;
+    prev.disabled = index === 0;
+    frame.replaceChildren(h("div", { class: "loading", text: "Opening the photo…" }));
+    side.replaceChildren();
+    let detail, response;
+    try { [detail, response] = await Promise.all([api(`/api/photos/${photo.id}`), fetch(`/api/photos/${photo.id}/image`)]); }
+    catch (e) { if (mine === viewerToken) frame.replaceChildren(h("div", { class: "loading", text: e.message })); return; }
+    if (mine !== viewerToken) return;
+    if (!response.ok) {
+      let message = "The photo could not be opened.";
+      try { message = (await response.json()).detail || message; } catch { /* keep default */ }
+      frame.replaceChildren(h("div", { class: "loading", text: message }));
+    } else {
+      if (imageUrl) URL.revokeObjectURL(imageUrl);
+      imageUrl = URL.createObjectURL(await response.blob());
+      if (mine !== viewerToken) return;
+      const boxes = detail.faces.filter((fc) => fc.status !== "ignored").map((fc) => {
+        const [x1, y1, x2, y2] = fc.box;
+        const named = fc.name && (fc.status === "auto" || fc.status === "confirmed");
+        const label = named ? fc.name : (fc.status === "review" && fc.name ? `${fc.name}?` : "Not labeled");
+        const el = h(named ? "button" : "span", { class: "fbox" + (named ? " named" : ""), type: named ? "button" : false,
+          title: named ? `Show photos of ${fc.name}` : "Not labeled yet",
+          style: `left:${x1 * 100}%;top:${y1 * 100}%;width:${(x2 - x1) * 100}%;height:${(y2 - y1) * 100}%`,
+          onclick: named ? () => { dialog.close(); location.hash = photosHash({ person: [fc.person_id], match: "all", uncertain: false, filter: "", year: "", month: "", q: "", order: "new" }); } : null },
+          h("span", { class: "blabel", text: label }));
+        return el;
+      });
+      frame.replaceChildren(h("div", { class: "frame" }, h("img", { src: imageUrl, alt: `${detail.name}`, class: "vimg" }), ...boxes));
+    }
+    const rows = detail.faces.filter((fc) => fc.status !== "ignored").map((fc) => {
+      const named = fc.name && (fc.status === "auto" || fc.status === "confirmed");
+      return h("div", { class: "vface" }, h("img", { src: thumb(fc.id), alt: "" }),
+        h("div", {}, h("div", { class: "t" + (named ? "" : " unnamed"), text: named ? fc.name : fc.status === "review" && fc.name ? `Maybe ${fc.name}` : "Not labeled yet" }),
+          named ? h("div", {}, h("button", { class: "linkbtn", type: "button", text: "Show their photos", onclick: () => { dialog.close(); location.hash = `#/photos?person=${fc.person_id}`; } }),
+            " · ", h("a", { href: `#/people/${fc.person_id}`, text: "Open person", onclick: () => dialog.close() }))
+            : h("div", {}, h("a", { href: fc.status === "review" ? `#/review${fc.person_id ? "/" + fc.person_id : ""}` : "#/unassigned", text: fc.status === "review" ? "Review it" : "See unassigned faces", onclick: () => dialog.close() }))));
+    });
+    side.replaceChildren(
+      h("h2", { text: detail.name }),
+      h("p", { class: "vmeta", text: `${detail.taken_at ? "Taken " + detail.taken_at.replace("T", " ") : "No date"} (${detail.date_source})` }),
+      h("p", { class: "vpath", text: detail.path }),
+      h("h3", { text: rows.length ? "People in this photo" : (detail.scanned ? "No faces found" : "Faces not scanned yet") }), ...rows,
+      h("div", { class: "vactions" },
+        h("button", { class: "btn", type: "button", text: "Rename", onclick: () => renamePhoto(photo, detail) }),
+        h("button", { class: "btn danger", type: "button", text: "Delete photo", onclick: () => deletePhoto(photo, detail) })));
+  }
+  show(index);
+}
+
 // ---------------------------------------------------------------- router
 function route() {
+  photoSel.clear(); lastPicked = null; selbar.hidden = true;
   clearSelection();
   state.actions = null;
   renderRail();
-  const [section, arg] = location.hash.replace(/^#\/?/, "").split("/");
+  const [pathPart, queryPart = ""] = location.hash.replace(/^#\/?/, "").split("?");
+  const [section, arg] = pathPart.split("/");
   window.scrollTo(0, 0);
+  if (section === "photos") return viewPhotos(new URLSearchParams(queryPart));
   if (section === "people" && arg) return viewPerson(Number(arg));
   if (section === "review") return viewReview(arg);
   if (section === "unassigned" || section === "ignored") return viewScope(section);

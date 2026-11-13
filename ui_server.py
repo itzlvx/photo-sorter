@@ -197,6 +197,9 @@ def create_app(db_path: Path, allowed_hosts: set[str] | None = None, any_host: b
 
     app.mount("/web", StaticFiles(directory=WEB_DIR), name="web")
 
+    from photo_browse import add_photo_routes  # phase 5: browse the whole library
+    add_photo_routes(app, get_db, db_path.parent / "thumbs")
+
     # ----------------------------------------------------------- read: summary
     @app.get("/api/summary")
     def summary(db: sqlite3.Connection = Depends(get_db)):
@@ -270,7 +273,7 @@ def create_app(db_path: Path, allowed_hosts: set[str] | None = None, any_host: b
         ).fetchall()
         return {"total": total, "people": people_json(db, rows)}
 
-    @app.get("/api/people/{person_id}")
+    @app.get("/api/people/{person_id:int}")
     def get_person(person_id: int, db: sqlite3.Connection = Depends(get_db)):
         rows = db.execute(f"{PEOPLE_SELECT} WHERE p.id = ?", (person_id,)).fetchall()
         if not rows:
@@ -395,7 +398,7 @@ def create_app(db_path: Path, allowed_hosts: set[str] | None = None, any_host: b
                 out.append(item)
         return out
 
-    @app.get("/api/people/{person_id}/similar")
+    @app.get("/api/people/{person_id:int}/similar")
     def similar_people(person_id: int, limit: int = 6, db: sqlite3.Connection = Depends(get_db)):
         table = centroid_table(db)
         i = table["index"].get(person_id)
@@ -444,7 +447,7 @@ def create_app(db_path: Path, allowed_hosts: set[str] | None = None, any_host: b
             db.execute("DELETE FROM persons WHERE id = ?", (source,))
         changed()
 
-    @app.post("/api/people/{person_id}/name")
+    @app.post("/api/people/{person_id:int}/name")
     def rename_person(person_id: int, body: NameBody, db: sqlite3.Connection = Depends(get_db)):
         get_existing_person(db, person_id)
         name = clean_name(body.name)
@@ -465,7 +468,7 @@ def create_app(db_path: Path, allowed_hosts: set[str] | None = None, any_host: b
         changed()
         return {"id": person_id, "name": name or ""}
 
-    @app.post("/api/people/{person_id}/merge")
+    @app.post("/api/people/{person_id:int}/merge")
     def merge_person(person_id: int, body: MergeBody, db: sqlite3.Connection = Depends(get_db)):
         merge_people(db, person_id, body.into)
         return {"merged_into": body.into}
