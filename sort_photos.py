@@ -122,6 +122,35 @@ FACE_SCHEMA = [
         model     TEXT NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS idx_faces_photo ON faces(photo_id)",
+    # Phase 3: people. A person is just a group of faces the AI thinks belong together.
+    # name stays NULL until you name the group in the web UI (phase 4).
+    """CREATE TABLE IF NOT EXISTS persons (
+        id         INTEGER PRIMARY KEY,
+        name       TEXT,
+        created_at TEXT NOT NULL
+    )""",
+    # Which person each face belongs to. status:
+    #   auto        the AI is confident
+    #   review      the AI is unsure; person_id (if set) is only its best guess. Shown to you in the UI.
+    #   unassigned  no good match (usually a one-off face); not shown in the review queue
+    #   confirmed   you checked it (set by the UI, never changed by the AI)
+    # reason says why a face is not 'auto' (low_quality, borderline, ambiguous, no_match, ...).
+    """CREATE TABLE IF NOT EXISTS face_person (
+        face_id     INTEGER PRIMARY KEY REFERENCES faces(id) ON DELETE CASCADE,
+        person_id   INTEGER REFERENCES persons(id) ON DELETE SET NULL,
+        similarity  REAL,
+        status      TEXT NOT NULL,
+        reason      TEXT,
+        assigned_at TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_face_person_person ON face_person(person_id)",
+    "CREATE INDEX IF NOT EXISTS idx_face_person_status ON face_person(status)",
+    # "This face is NOT this person" answers from the UI, so the AI never suggests them again.
+    """CREATE TABLE IF NOT EXISTS face_rejections (
+        face_id   INTEGER NOT NULL REFERENCES faces(id) ON DELETE CASCADE,
+        person_id INTEGER NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+        PRIMARY KEY (face_id, person_id)
+    )""",
 ]
 
 log = logging.getLogger("photo_sorter")
@@ -819,6 +848,16 @@ def show_info(args: argparse.Namespace) -> int:
                     "Face scan: %d of %d photos scanned (%d with faces, %d errors); %d faces stored",
                     ok, total, with_faces, failed, face_total,
                 )
+            if {"persons", "face_person"} <= tables:
+                by_status = dict(conn.execute("SELECT status, COUNT(*) FROM face_person GROUP BY status"))
+                people = conn.execute("SELECT COUNT(*) FROM persons").fetchone()[0]
+                named = conn.execute("SELECT COUNT(*) FROM persons WHERE name IS NOT NULL AND name <> ''").fetchone()[0]
+                if people or by_status:
+                    log.info(
+                        "People: %d groups (%d named); faces: %d auto, %d confirmed, %d to review, %d unassigned",
+                        people, named, by_status.get("auto", 0), by_status.get("confirmed", 0),
+                        by_status.get("review", 0), by_status.get("unassigned", 0),
+                    )
         finally:
             conn.close()
     except sqlite3.Error as error:
@@ -873,6 +912,7 @@ def build_parser() -> argparse.ArgumentParser:
     faces_cmd.add_argument("--limit", type=int, default=None, help="only scan this many photos (good for a first test)")
     faces_cmd.add_argument("--rescan", action="store_true", help="scan every photo again, replacing earlier results")
     faces_cmd.add_argument("--retry-errors", action="store_true", help="also retry photos that failed before")
+    faces_cmd.add_argument("--discard-confirmed", action="store_true", help="allow re-scanning photos whose faces you confirmed in the UI (their confirmations are erased)")
     hardware = faces_cmd.add_mutually_exclusive_group()
     hardware.add_argument("--gpu", action="store_true", help="require the NVIDIA GPU (CUDA): stop with an explanation instead of quietly using the CPU")
     hardware.add_argument("--cpu", action="store_true", help="ignore any GPU and use the CPU")
@@ -892,13 +932,29 @@ def build_parser() -> argparse.ArgumentParser:
     gpucheck_cmd.add_argument("--det-size", type=int, default=640, help="detector input size used for the test (default 640)")
     gpucheck_cmd.add_argument("--runs", type=int, default=5, help="timed runs per device (default 5)")
 
+    cluster_cmd = commands.add_parser(
+        "cluster", parents=[common],
+        help="group similar faces into people and flag the uncertain ones (phase 3)",
+    )
+    cluster_cmd.add_argument("--recluster", action="store_true", help="start the AI's grouping over (people you named and faces you confirmed are always kept)")
+    cluster_cmd.add_argument("--threshold", type=float, default=0.50, help="similarity needed to join a person automatically, 0-1 (default 0.50)")
+    cluster_cmd.add_argument("--review-threshold", type=float, default=0.35, help="below this a face is not even suggested for a person (default 0.35)")
+    cluster_cmd.add_argument("--merge-threshold", type=float, default=0.60, help="merge two AI-made groups whose averages are this similar (default 0.60)")
+    cluster_cmd.add_argument("--margin", type=float, default=0.06, help="the best person must beat the runner-up by this much, else the face goes to review (default 0.06)")
+    cluster_cmd.add_argument("--min-group-size", type=int, default=3, help="smaller new groups are dropped as one-off faces (default 3)")
+    cluster_cmd.add_argument("--min-det-score", type=float, default=0.60, help="faces detected with less confidence are treated as low quality (default 0.60)")
+    cluster_cmd.add_argument("--min-face-px", type=int, default=50, help="faces smaller than this many pixels are low quality (default 50)")
+    cluster_cmd.add_argument("--min-blur", type=float, default=20.0, help="faces blurrier than this sharpness value are low quality (default 20)")
+    cluster_cmd.add_argument("--max-yaw", type=float, default=45.0, help="faces turned more than this many degrees are low quality (default 45)")
+    cluster_cmd.add_argument("--model", default=None, help="only use faces from this model pack (default: the one used most)")
+
     commands.add_parser("info", parents=[base], help="show where the index database is and what it contains")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    if argv and argv[0] not in {"sort", "refresh", "info", "faces", "gpucheck", "-h", "--help"}:
+    if argv and argv[0] not in {"sort", "refresh", "info", "faces", "gpucheck", "cluster", "-h", "--help"}:
         argv = ["sort", *argv]  # keep the original "sort_photos.py SOURCE DEST" form working
     args = build_parser().parse_args(argv)
     setup_logging(args.verbose, args.log_file)
@@ -906,6 +962,13 @@ def main(argv: list[str] | None = None) -> int:
         return refresh(args)
     if args.command == "info":
         return show_info(args)
+    if args.command == "cluster":
+        try:
+            import face_cluster  # needs numpy only
+        except ImportError as error:
+            log.error("Grouping faces needs numpy (%s). Install it with: pip install -r requirements-faces.txt", error)
+            return 2
+        return face_cluster.cluster_faces(args)
     if args.command in ("faces", "gpucheck"):
         try:
             import face_scan  # needs extra packages, so only loaded for these commands

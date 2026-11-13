@@ -137,7 +137,52 @@ Good to know:
   group photos. The scan reads photos in background threads, so a network drive is usually the
   limit once the GPU is working.
 
+## Phase 3: group faces into people
+
+    python sort_photos.py cluster            # dry run: shows what it would do, saves nothing
+    python sort_photos.py cluster --apply    # save the grouping
+
+This groups faces that look like the same person. It never names anyone (you do that in the web
+UI in phase 4) and it only needs numpy, not a GPU. 30,000 faces take a few seconds.
+
+How each face is labelled:
+
+| Label | Meaning |
+|---|---|
+| `auto` | Confident: good quality, similar enough to the person, and a clear winner over the runner-up |
+| `review` | The AI is unsure. Its best guess is saved as a suggestion. These are what the UI shows you the next time you open it. Reasons: `borderline` (similarity only just enough), `ambiguous` (two people look alike), `low_quality` (small, blurry, turned or low-confidence face) |
+| `unassigned` | No good match, usually a stranger in the background. Not in the review queue, but the UI can list them |
+| `confirmed` | You checked it in the UI. The AI never changes these |
+
+Running it again is safe:
+- By default only new faces and still-uncertain faces are placed. Every `auto` face stays where it is, and
+  person numbers stay the same, so run it after each `faces --apply`.
+- `--recluster` lets the AI regroup its own work from scratch. People you named and faces you confirmed
+  are always kept, along with the faces already in a named person's group. New faces are matched against them.
+- Everything is saved in one transaction: an interrupted run changes nothing.
+- Two existing people are never merged automatically (merging is your call in the UI). New groups that look
+  like the same person are merged.
+- "This is not person X" answers from the UI are stored and respected: that face is never suggested for X again.
+- `faces --rescan` replaces a photo's face rows, which would erase your confirmations for it, so it refuses
+  to touch photos with confirmed faces unless you add `--discard-confirmed`.
+
+Tuning. The defaults are a careful starting point, not tuned on your photos:
+
+| Option | Default | Raise it when... / lower it when... |
+|---|---|---|
+| `--threshold` | 0.50 | Raise if different people end up in one group; lower if one person is split across many groups |
+| `--review-threshold` | 0.35 | Lowest similarity at which a face is even suggested for a person |
+| `--merge-threshold` | 0.60 | Lower to merge split groups more aggressively |
+| `--margin` | 0.06 | Raise to send more look-alike cases to review |
+| `--min-group-size` | 3 | Smaller new groups are treated as one-off faces |
+| `--min-det-score`, `--min-face-px`, `--min-blur`, `--max-yaw` | 0.60, 50, 20, 45 | What counts as a good-quality face |
+
+The run ends with a summary, including the similarity of the auto faces, so you can see how tight the groups
+are. If many faces land in `review`, check a few groups in the UI, adjust the options and run again with
+`--recluster`. Children change a lot as they grow, so expect one child to appear as two or three groups
+(different ages); the UI will let you merge them.
+
 ## Roadmap
 - Phase 2: InsightFace detection + embeddings stored in SQLite (done)
-- Phase 3: clustering, with low-confidence faces flagged for review
+- Phase 3: clustering, with low-confidence faces flagged for review (done)
 - Phase 4: FastAPI web UI to name people and work the review queue

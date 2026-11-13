@@ -398,6 +398,28 @@ def scan_faces(args) -> int:
     limited = f" (limited from {len(pending)} by --limit)" if len(todo) < len(pending) else ""
     log.info("To scan now: %d%s", len(todo), limited)
 
+    # Re-scanning a photo replaces its face rows, which would also erase the names you
+    # confirmed for those faces. Refuse unless the person explicitly allows it.
+    if todo and has_table(conn, "face_person"):
+        protected = {
+            row[0] for row in conn.execute(
+                "SELECT DISTINCT f.photo_id FROM face_person fp JOIN faces f ON f.id = fp.face_id WHERE fp.status = 'confirmed'"
+            )
+        }
+        hit = sum(1 for photo_id, _ in todo if photo_id in protected)
+        if hit:
+            message = (
+                "%d of these photos hold faces you confirmed in the UI. Scanning them again would erase those "
+                "confirmations. Add --discard-confirmed to scan them anyway, or use --limit / skip --rescan."
+            )
+            if not args.discard_confirmed:
+                if args.apply:
+                    log.error(message, hit)
+                    return 2
+                log.warning(message, hit)
+            else:
+                log.warning("%d photo(s) hold confirmed faces; their confirmations will be discarded (--discard-confirmed).", hit)
+
     problem = runtime_problem()
     if problem:
         message = (
