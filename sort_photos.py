@@ -1,0 +1,788 @@
+#!/usr/bin/env python3
+"""Photo sorter: sort photos into Year/Month folders by date taken, and keep a
+local SQLite index of every photo.
+
+Everything is a dry run until you pass --apply.
+
+    python sort_photos.py SOURCE DEST            # preview ('sort' is the default command)
+    python sort_photos.py SOURCE DEST --apply    # copy photos into DEST
+    python sort_photos.py SOURCE DEST --apply --move
+
+Refresh mode rebuilds/updates the index from a library that is already sorted
+(also the starting point for face recognition on existing photos):
+
+    python sort_photos.py refresh LIBRARY            # preview what would change
+    python sort_photos.py refresh LIBRARY --apply    # update the index
+    python sort_photos.py refresh LIBRARY --apply --prune   # also drop rows for deleted files
+
+Show where the index database is, and what is in it:
+
+    python sort_photos.py info
+
+Logging: key steps are always printed. Add -v for detailed (debug) output and
+--log-file FILE to also save a full debug log to a file.
+
+Date priority: EXIF DateTimeOriginal > DateTimeDigitized > DateTime >
+file system date (earliest of creation/modified time on Windows, modified
+time elsewhere). Every photo records which source its date came from.
+
+Duplicates are detected by SHA-256 content hash, both within a run and
+against earlier runs (via the local index, see --db). Duplicate files are
+reported and left untouched.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import logging
+import os
+import shutil
+import sqlite3
+import sys
+import time
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+
+from PIL import Image
+
+try:  # HEIC/HEIF support (iPhone photos)
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+except ImportError:
+    pass
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tif", ".tiff", ".webp"}
+MONTH_NAMES = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+MONTH_ABBR = [
+    "jan", "feb", "mar", "apr", "may", "jun",
+    "jul", "aug", "sep", "oct", "nov", "dec",
+]
+EXIF_IFD = 0x8769  # pointer to the Exif sub-directory
+TAG_DATETIME_ORIGINAL = 0x9003
+TAG_DATETIME_DIGITIZED = 0x9004
+TAG_DATETIME = 0x0132
+DB_NAME = "photo_index.db"
+PROGRESS_EVERY = 200
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS photos (
+    id            INTEGER PRIMARY KEY,
+    sha256        TEXT NOT NULL UNIQUE,
+    original_path TEXT NOT NULL,
+    sorted_path   TEXT NOT NULL,
+    taken_at      TEXT NOT NULL,
+    date_source   TEXT NOT NULL,
+    size_bytes    INTEGER NOT NULL,
+    sorted_at     TEXT NOT NULL,
+    mtime_ns      INTEGER
+)
+"""
+
+log = logging.getLogger("photo_sorter")
+
+
+# --------------------------------------------------------------------------
+# Logging
+# --------------------------------------------------------------------------
+class ConsoleFormatter(logging.Formatter):
+    """Plain messages normally; timestamps and levels when -v is used."""
+
+    def __init__(self, verbose: bool) -> None:
+        super().__init__()
+        self.verbose = verbose
+
+    def format(self, record: logging.LogRecord) -> str:
+        message = record.getMessage()
+        if self.verbose:
+            return f"{self.formatTime(record, '%H:%M:%S')} {record.levelname:<7} {message}"
+        if record.levelno >= logging.WARNING:
+            return f"{record.levelname}: {message}"
+        return message
+
+
+class _BelowWarning(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno < logging.WARNING
+
+
+def setup_logging(verbose: bool = False, log_file: Path | None = None) -> None:
+    log.handlers.clear()
+    log.setLevel(logging.DEBUG)
+    log.propagate = False
+    formatter = ConsoleFormatter(verbose)
+
+    out = logging.StreamHandler(sys.stdout)  # normal messages
+    out.setLevel(logging.DEBUG if verbose else logging.INFO)
+    out.addFilter(_BelowWarning())
+    out.setFormatter(formatter)
+    log.addHandler(out)
+
+    err = logging.StreamHandler(sys.stderr)  # warnings and errors
+    err.setLevel(logging.WARNING)
+    err.setFormatter(formatter)
+    log.addHandler(err)
+
+    if log_file:
+        try:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            handler = logging.FileHandler(log_file, encoding="utf-8")
+        except OSError as error:
+            log.warning("Cannot open log file %s: %s", log_file, error)
+        else:
+            handler.setLevel(logging.DEBUG)  # the file always gets full detail
+            handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s"))
+            log.addHandler(handler)
+            log.info("Saving a full debug log to: %s", log_file)
+
+
+def human_size(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{num_bytes} B"
+
+
+# --------------------------------------------------------------------------
+# Dates
+# --------------------------------------------------------------------------
+def parse_exif_date(value) -> datetime | None:
+    """Parse an EXIF date string; return None for blank or bogus values."""
+    if not value:
+        return None
+    if isinstance(value, bytes):
+        value = value.decode(errors="ignore")
+    text = str(value).strip().strip("\x00")[:19]
+    for fmt in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            parsed = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        if parsed.year >= 1900:
+            return parsed
+    return None
+
+
+def read_exif_date(path: Path) -> tuple[datetime, str] | None:
+    try:
+        with Image.open(path) as img:
+            exif = img.getexif()
+            exif_ifd = exif.get_ifd(EXIF_IFD)
+            candidates = (
+                (exif_ifd.get(TAG_DATETIME_ORIGINAL), "exif_original"),
+                (exif_ifd.get(TAG_DATETIME_DIGITIZED), "exif_digitized"),
+                (exif.get(TAG_DATETIME), "exif_modified"),
+            )
+    except Exception as error:  # corrupt or unusual files raise many different errors
+        log.debug("Could not read EXIF from %s: %s", path.name, error)
+        return None
+    for raw, label in candidates:
+        parsed = parse_exif_date(raw)
+        if parsed:
+            return parsed, label
+    return None
+
+
+def file_system_date(path: Path) -> datetime:
+    stat = path.stat()
+    timestamp = stat.st_mtime
+    if os.name == "nt":  # on Windows st_ctime is the creation time
+        timestamp = min(timestamp, stat.st_ctime)
+    return datetime.fromtimestamp(timestamp)
+
+
+def get_taken_date(path: Path) -> tuple[datetime, str]:
+    return read_exif_date(path) or (file_system_date(path), "file_date")
+
+
+# --------------------------------------------------------------------------
+# Files and hashing
+# --------------------------------------------------------------------------
+def sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def iter_photos(source: Path, exclude: Path | None = None, onerror=None):
+    """Yield image files under source, optionally skipping one folder."""
+    for root, dirs, files in os.walk(source, onerror=onerror):
+        root_path = Path(root)
+        if exclude is not None:
+            dirs[:] = [d for d in dirs if (root_path / d).resolve() != exclude]
+        for name in sorted(files):
+            path = root_path / name
+            if path.suffix.lower() in IMAGE_EXTS:
+                yield path
+
+
+def month_folder(month: int, style: str) -> str:
+    if style == "number":
+        return f"{month:02d}"
+    if style == "name":
+        return MONTH_NAMES[month - 1]
+    if style == "full":
+        return f"{month:02d}-{MONTH_NAMES[month - 1].lower()}"
+    return f"{month:02d}-{MONTH_ABBR[month - 1]}"  # "abbr": 01-jan, 02-feb, ...
+
+
+def choose_destination(
+    folder: Path, name: str, sha: str, reserved: set[Path]
+) -> tuple[Path, bool]:
+    """Pick a free filename in folder. Returns (path, is_duplicate).
+
+    If a file with this name already exists and has identical content, the
+    photo is already sorted, so it is flagged as a duplicate.
+    """
+    candidate = folder / name
+    stem, suffix = candidate.stem, candidate.suffix
+    counter = 1
+    while candidate.exists() or candidate in reserved:
+        if candidate.exists() and sha256_of(candidate) == sha:
+            return candidate, True
+        candidate = folder / f"{stem}_{counter}{suffix}"
+        counter += 1
+    return candidate, False
+
+
+def transfer(src: Path, target: Path, move: bool, sha: str) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, target)
+    if move:
+        # Only delete the original after proving the copy is identical.
+        if sha256_of(target) != sha:
+            target.unlink(missing_ok=True)
+            raise OSError("copy verification failed; original left in place")
+        src.unlink()
+        log.debug("Verified the copy, then deleted the original: %s", src)
+
+
+# --------------------------------------------------------------------------
+# Index database
+# --------------------------------------------------------------------------
+def default_db_path() -> Path:
+    """Index lives on the local disk: SQLite is unreliable on network shares."""
+    base = os.environ.get("LOCALAPPDATA") or (Path.home() / ".local" / "share")
+    return Path(base) / "photo-sorter" / DB_NAME
+
+
+def is_network_path(path: Path) -> bool:
+    if os.name != "nt":
+        return False
+    text = str(path)
+    if text.startswith("\\\\?\\UNC\\") or (
+        text.startswith("\\\\") and not text.startswith("\\\\?\\")
+    ):
+        return True
+    try:
+        import ctypes
+
+        return bool(path.drive) and ctypes.windll.kernel32.GetDriveTypeW(path.drive + "\\") == 4
+    except Exception:
+        return False
+
+
+def log_index_location(db_path: Path, apply: bool) -> None:
+    """Always tell the user exactly where the index database is."""
+    if db_path.exists():
+        log.info("Index database: %s (%s)", db_path, human_size(db_path.stat().st_size))
+    elif apply:
+        log.info("Index database: %s (new, will be created)", db_path)
+    else:
+        log.info("Index database: %s (does not exist yet; a dry run does not create it)", db_path)
+    if is_network_path(db_path):
+        log.warning(
+            "The index %s is on a network drive. SQLite can fail there; use a local path with --db.",
+            db_path,
+        )
+
+
+def load_known_hashes(db_path: Path) -> set[str]:
+    if not db_path.exists():
+        return set()
+    conn = sqlite3.connect(db_path)
+    try:
+        return {row[0] for row in conn.execute("SELECT sha256 FROM photos")}
+    except sqlite3.OperationalError:
+        return set()
+    finally:
+        conn.close()
+
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(SCHEMA)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(photos)")}
+    if "mtime_ns" not in columns:  # index created by an older version of this script
+        log.info("Upgrading the index to the current format (adding mtime_ns)")
+        conn.execute("ALTER TABLE photos ADD COLUMN mtime_ns INTEGER")
+    conn.commit()
+
+
+def open_index(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path, timeout=30)
+    # Keep the rollback journal in memory so SQLite never has to create a
+    # separate *.db-journal file (OneDrive/antivirus can block that on Windows).
+    conn.execute("PRAGMA journal_mode=MEMORY")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    ensure_schema(conn)
+    log.debug("Opened the index %s", db_path)
+    return conn
+
+
+def record_photo(conn, sha, src, target, taken, date_source) -> None:
+    stat = target.stat()
+    row = (
+        sha,
+        str(src),
+        str(target),
+        taken.isoformat(timespec="seconds"),
+        date_source,
+        stat.st_size,
+        datetime.now().isoformat(timespec="seconds"),
+        stat.st_mtime_ns,
+    )
+    for attempt in range(5):  # retry: sync clients/antivirus can lock the file briefly
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO photos (sha256, original_path, sorted_path,"
+                " taken_at, date_source, size_bytes, sorted_at, mtime_ns) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                row,
+            )
+            conn.commit()
+            return
+        except sqlite3.OperationalError as error:
+            if attempt == 4:
+                raise
+            log.debug("Index write failed (%s); retrying (attempt %d of 5)", error, attempt + 2)
+            time.sleep(0.5 * (attempt + 1))
+
+
+def load_index_rows(conn: sqlite3.Connection) -> list[dict]:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(photos)")}
+    mtime_col = "mtime_ns" if "mtime_ns" in columns else "NULL"
+    query = f"SELECT id, sha256, sorted_path, size_bytes, {mtime_col} FROM photos ORDER BY id"
+    return [
+        {"id": r[0], "sha": r[1], "path": r[2], "size": r[3], "mtime": r[4]}
+        for r in conn.execute(query)
+    ]
+
+
+# --------------------------------------------------------------------------
+# sort command
+# --------------------------------------------------------------------------
+def run(args: argparse.Namespace) -> int:
+    started = time.monotonic()
+    source = args.source.resolve()
+    dest = args.dest.resolve()
+    if not source.is_dir():
+        log.error("Source folder not found: %s", source)
+        return 2
+    if source == dest:
+        log.error("Source and destination must be different folders.")
+        return 2
+
+    verb = "MOVE" if args.move else "COPY"
+    db_path = (args.db or default_db_path()).resolve()
+    log.info("=== Sort started (%s, %s) ===", "apply" if args.apply else "dry run", "move" if args.move else "copy")
+    log.info("Source:        %s", source)
+    log.info("Destination:   %s", dest)
+    log.info("Month folders: %s (for example %s)", args.month_format, month_folder(3, args.month_format))
+    log_index_location(db_path, args.apply)
+
+    conn = None
+    if args.apply:
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            conn = open_index(db_path)
+        except (OSError, sqlite3.Error) as error:
+            log.error("Cannot open the index %s: %s", db_path, error)
+            return 2
+
+    seen = load_known_hashes(db_path)
+    log.info("The index already knows %d photos", len(seen))
+    reserved: set[Path] = set()
+    stats: Counter[str] = Counter()
+    detail = log.debug if args.apply else log.info  # per-file lines: preview always, apply with -v
+
+    log.info("Scanning %s ...", source)
+    for src in iter_photos(source, exclude=dest):
+        stats["scanned"] += 1
+        try:
+            sha = sha256_of(src)
+            log.debug("Hashed %s -> %s", src.name, sha[:12])
+            if sha in seen:
+                stats["duplicates"] += 1
+                detail("SKIP (duplicate)  %s", src)
+                continue
+
+            taken, date_source = get_taken_date(src)
+            log.debug("Date for %s: %s (from %s)", src.name, taken.isoformat(timespec="seconds"), date_source)
+            folder = dest / f"{taken.year:04d}" / month_folder(taken.month, args.month_format)
+            target, is_duplicate = choose_destination(folder, src.name, sha, reserved)
+            if is_duplicate:
+                stats["duplicates"] += 1
+                detail("SKIP (already sorted)  %s", src)
+                continue
+            if target.name != src.name:
+                log.debug("Name clash: %s will be saved as %s", src.name, target.name)
+
+            if args.apply:
+                transfer(src, target, args.move, sha)
+                log.debug("%s complete: %s", verb.title(), target)
+                try:
+                    record_photo(conn, sha, src, target, taken, date_source)
+                    log.debug("Index row written for %s", target.name)
+                except sqlite3.Error as error:
+                    stats["index_errors"] += 1
+                    if stats["index_errors"] == 1:
+                        log.warning(
+                            "Could not write to the index %s: %s. Photos are still being sorted, "
+                            "but the index will be incomplete.",
+                            db_path, error,
+                        )
+            seen.add(sha)
+            reserved.add(target)
+            stats["sorted"] += 1
+            stats[f"date:{date_source}"] += 1
+            detail("%s  %s  ->  %s  [%s]", verb if args.apply else f"WOULD {verb}", src, target, date_source)
+        except OSError as error:
+            stats["errors"] += 1
+            log.error("%s: %s", src, error)
+
+        if args.apply and stats["scanned"] % PROGRESS_EVERY == 0:
+            log.info(
+                "Progress: %d scanned, %d sorted, %d duplicates",
+                stats["scanned"], stats["sorted"], stats["duplicates"],
+            )
+
+    if conn:
+        conn.close()
+
+    log.info("--- Summary ---")
+    log.info("%-22s%d", "Photos scanned:", stats["scanned"])
+    log.info("%-22s%d", "Photos sorted:" if args.apply else "Would sort:", stats["sorted"])
+    log.info("%-22s%d", "Duplicates skipped:", stats["duplicates"])
+    log.info("%-22s%d", "Errors:", stats["errors"])
+    if stats["index_errors"]:
+        log.warning("Index write failures: %d (try --db on a local folder)", stats["index_errors"])
+    for key in sorted(k for k in stats if k.startswith("date:")):
+        log.info("  dated by %s: %d", key[5:], stats[key])
+    if stats["date:file_date"]:
+        log.info("  (file_date means no EXIF date was found; those may be worth a look)")
+    log_index_location(db_path, args.apply)
+    log.info("Finished in %.1f seconds", time.monotonic() - started)
+    if not args.apply:
+        log.info("Dry run only: nothing was changed. Re-run with --apply to sort for real.")
+    return 1 if stats["errors"] else 0
+
+
+# --------------------------------------------------------------------------
+# refresh command: rebuild/refresh the index from an already-sorted library
+# --------------------------------------------------------------------------
+def _norm(path) -> str:
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def refresh(args: argparse.Namespace) -> int:
+    """Walk an already-sorted library and bring the index in line with the disk.
+
+    - new files          -> added to the index (dated from EXIF/file date)
+    - moved/renamed      -> path updated (matched by content hash)
+    - extra copies       -> reported as duplicates, never touched
+    - files that are gone -> reported; removed from the index only with --prune
+    Files whose path, size and modified time are unchanged are not re-hashed,
+    so repeat refreshes of a big library are fast (use --rehash to force).
+    """
+    started = time.monotonic()
+    library = args.library.resolve()
+    if not library.is_dir():
+        log.error("Library folder not found: %s", library)
+        return 2
+    db_path = (args.db or default_db_path()).resolve()
+    log.info("=== Refresh started (%s) ===", "apply" if args.apply else "dry run")
+    log.info("Library:  %s", library)
+    log.info("Options:  prune=%s, rehash=%s", args.prune, args.rehash)
+    log_index_location(db_path, args.apply)
+
+    conn = None
+    rows: list[dict] = []
+    if args.apply:
+        try:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            conn = open_index(db_path)
+            rows = load_index_rows(conn)
+        except (OSError, sqlite3.Error) as error:
+            log.error("Cannot open the index %s: %s", db_path, error)
+            return 2
+    elif db_path.exists():
+        try:
+            read_only = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+            try:
+                rows = load_index_rows(read_only)
+            finally:
+                read_only.close()
+        except sqlite3.Error as error:
+            log.debug("Could not read the existing index (%s); treating it as empty", error)
+            rows = []
+
+    root = _norm(library)
+    original_rows = list(rows)
+    under_library = sum(1 for r in rows if _norm(r["path"]).startswith(root + os.sep))
+    log.info("The index has %d photos (%d under this library)", len(rows), under_library)
+    by_sha = {r["sha"]: r for r in rows}
+    by_path = {_norm(r["path"]): r for r in rows}  # if a path repeats, the newest row wins
+    seen_shas: set[str] = set()
+    walk_errors: list = []
+    stats: Counter[str] = Counter()
+    detail = log.debug if args.apply else log.info  # per-file lines: preview always, apply with -v
+    hashed = 0
+    pending = 0
+
+    def write(sql: str, params: tuple) -> None:
+        nonlocal pending
+        if not conn:
+            return
+        try:
+            conn.execute(sql, params)
+            log.debug("Index %s", sql.split()[0])
+            pending += 1
+            if pending % 200 == 0:
+                conn.commit()  # keep progress if the run is interrupted
+                log.debug("Committed %d index changes so far", pending)
+        except sqlite3.Error as error:
+            stats["index_errors"] += 1
+            if stats["index_errors"] == 1:
+                log.warning("Could not write to the index %s: %s", db_path, error)
+
+    log.info("Scanning %s ...", library)
+    for path in iter_photos(library, onerror=walk_errors.append):
+        stats["scanned"] += 1
+        key = _norm(path)
+        try:
+            st = path.stat()
+            size, mtime = st.st_size, st.st_mtime_ns
+            row = by_path.get(key)
+            if (
+                row is not None
+                and not args.rehash
+                and row["mtime"] is not None
+                and row["size"] == size
+                and row["mtime"] == mtime
+            ):
+                log.debug("Unchanged (not re-hashed): %s", path)
+                seen_shas.add(row["sha"])
+                stats["unchanged"] += 1
+                continue
+
+            sha = sha256_of(path)
+            hashed += 1
+            log.debug("Hashed %s -> %s", path.name, sha[:12])
+            seen_shas.add(sha)
+            known = by_sha.get(sha)
+
+            if known is None:
+                taken, date_source = get_taken_date(path)
+                log.debug("Date for %s: %s (from %s)", path.name, taken.isoformat(timespec="seconds"), date_source)
+                new_row = {"id": None, "sha": sha, "path": str(path), "size": size, "mtime": mtime}
+                by_sha[sha] = new_row
+                by_path[key] = new_row
+                stats["added"] += 1
+                stats[f"date:{date_source}"] += 1
+                detail("ADD  %s  [%s]", path, date_source)
+                write(
+                    "INSERT OR IGNORE INTO photos (sha256, original_path, sorted_path, taken_at,"
+                    " date_source, size_bytes, sorted_at, mtime_ns) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        sha, str(path), str(path), taken.isoformat(timespec="seconds"),
+                        date_source, size, datetime.now().isoformat(timespec="seconds"), mtime,
+                    ),
+                )
+            elif _norm(known["path"]) == key:
+                if known["size"] != size or known["mtime"] != mtime:
+                    stats["timestamps_updated"] += 1
+                    log.debug("Recording the current size and modified time for %s", path.name)
+                    known.update(size=size, mtime=mtime)
+                    write(
+                        "UPDATE photos SET size_bytes=?, mtime_ns=? WHERE sha256=?",
+                        (size, mtime, sha),
+                    )
+            elif os.path.exists(known["path"]):
+                stats["duplicate_files"] += 1
+                detail("DUPLICATE  %s  (same content as %s)", path, known["path"])
+            else:
+                stats["moved"] += 1
+                detail("MOVED  %s  ->  %s", known["path"], path)
+                known.update(path=str(path), size=size, mtime=mtime)
+                by_path[key] = known
+                write(
+                    "UPDATE photos SET sorted_path=?, size_bytes=?, mtime_ns=? WHERE sha256=?",
+                    (str(path), size, mtime, sha),
+                )
+        except OSError as error:
+            stats["errors"] += 1
+            log.error("%s: %s", path, error)
+
+        if stats["scanned"] % PROGRESS_EVERY == 0:
+            log.info("Progress: %d scanned, %d hashed", stats["scanned"], hashed)
+
+    for error in walk_errors:
+        stats["errors"] += 1
+        log.error("Could not read folder: %s", error)
+    log.info(
+        "Scan complete: %d photos found, %d hashed, %d skipped as unchanged",
+        stats["scanned"], hashed, stats["unchanged"],
+    )
+
+    missing = [
+        r for r in original_rows
+        if r["sha"] not in seen_shas and _norm(r["path"]).startswith(root + os.sep)
+    ]
+    stats["missing"] = len(missing)
+    for r in missing:
+        detail("MISSING  %s", r["path"])
+
+    pruned = 0
+    if args.prune and args.apply and missing:
+        if stats["errors"] or not stats["scanned"]:
+            log.warning(
+                "Skipping --prune: the scan had errors or found no photos "
+                "(is the drive connected?). Nothing was removed from the index."
+            )
+        else:
+            log.info("Pruning %d index rows for files that no longer exist", len(missing))
+            for r in missing:
+                write("DELETE FROM photos WHERE id = ?", (r["id"],))
+                pruned += 1
+
+    if conn:
+        conn.commit()
+        conn.close()
+        log.debug("Index saved and closed")
+
+    log.info("--- Refresh summary ---")
+    log.info("%-28s%d", "Photos scanned:", stats["scanned"])
+    log.info("%-28s%d", "Unchanged (not re-hashed):", stats["unchanged"])
+    log.info("%-28s%d", "Added to index:" if args.apply else "Would add:", stats["added"])
+    log.info("%-28s%d", "Moved/renamed:" if args.apply else "Would update (moved):", stats["moved"])
+    log.info("%-28s%d", "Timestamps refreshed:", stats["timestamps_updated"])
+    log.info("%-28s%d (extra copies, left alone)", "Duplicate files:", stats["duplicate_files"])
+    log.info("%-28s%d%s", "Missing from disk:", stats["missing"], f" (pruned {pruned})" if pruned else "")
+    log.info("%-28s%d", "Errors:", stats["errors"])
+    if stats["index_errors"]:
+        log.warning("Index write failures: %d (see the warning above)", stats["index_errors"])
+    for key in sorted(k for k in stats if k.startswith("date:")):
+        log.info("  new photos dated by %s: %d", key[5:], stats[key])
+    if stats["missing"] and not pruned:
+        log.info("  (rows for missing files are kept; add --apply --prune to remove them)")
+    log_index_location(db_path, args.apply)
+    log.info("Finished in %.1f seconds", time.monotonic() - started)
+    if not args.apply:
+        log.info("Dry run only: the index was not changed. Re-run with --apply to update it.")
+    return 1 if stats["errors"] or stats["index_errors"] else 0
+
+
+# --------------------------------------------------------------------------
+# info command
+# --------------------------------------------------------------------------
+def show_info(args: argparse.Namespace) -> int:
+    db_path = (args.db or default_db_path()).resolve()
+    log.info("Index database: %s", db_path)
+    if is_network_path(db_path):
+        log.warning("This path is on a network drive. SQLite can fail there; use a local path with --db.")
+    if not db_path.exists():
+        log.info("The file does not exist yet. It is created by the first 'sort ... --apply' or 'refresh ... --apply'.")
+        return 0
+    stat = db_path.stat()
+    log.info(
+        "Size: %s, last modified %s",
+        human_size(stat.st_size),
+        datetime.fromtimestamp(stat.st_mtime).isoformat(sep=" ", timespec="seconds"),
+    )
+    try:
+        conn = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+        try:
+            total = conn.execute("SELECT COUNT(*) FROM photos").fetchone()[0]
+            log.info("Photos indexed: %d", total)
+            for date_source, count in conn.execute(
+                "SELECT date_source, COUNT(*) FROM photos GROUP BY date_source ORDER BY 2 DESC"
+            ):
+                log.info("  dated by %s: %d", date_source, count)
+            first, last = conn.execute("SELECT MIN(taken_at), MAX(taken_at) FROM photos").fetchone()
+            if first:
+                log.info("Photos taken from %s to %s", first[:10], last[:10])
+        finally:
+            conn.close()
+    except sqlite3.Error as error:
+        log.error("Could not read the index: %s", error)
+        return 1
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Command line
+# --------------------------------------------------------------------------
+def build_parser() -> argparse.ArgumentParser:
+    base = argparse.ArgumentParser(add_help=False)
+    base.add_argument("--db", type=Path, default=None, help="index database location (default: a local app-data folder; keep it off network drives)")
+    base.add_argument("-v", "--verbose", action="store_true", help="detailed (debug) output")
+    base.add_argument("--log-file", type=Path, default=None, help="also save a full debug log to this file")
+
+    common = argparse.ArgumentParser(add_help=False, parents=[base])
+    common.add_argument("--apply", action="store_true", help="make changes (default is a dry run)")
+
+    parser = argparse.ArgumentParser(description="Photo sorter: sort photos by date and keep a local index.")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    sort_cmd = commands.add_parser(
+        "sort", parents=[common],
+        help="sort photos from SOURCE into Year/Month folders in DEST (default command)",
+    )
+    sort_cmd.add_argument("source", type=Path, help="folder containing the photos (searched recursively)")
+    sort_cmd.add_argument("dest", type=Path, help="folder to sort photos into")
+    sort_cmd.add_argument("--move", action="store_true", help="move instead of copy (originals deleted only after verification)")
+    sort_cmd.add_argument(
+        "--month-format",
+        choices=["abbr", "full", "number", "name"],
+        default="abbr",
+        help="month folder style: abbr=03-mar (default), full=03-march, number=03, name=March",
+    )
+
+    refresh_cmd = commands.add_parser(
+        "refresh", parents=[common],
+        help="refresh the index from an already-sorted library",
+    )
+    refresh_cmd.add_argument("library", type=Path, help="the sorted library folder (Year/Month folders)")
+    refresh_cmd.add_argument("--prune", action="store_true", help="with --apply: remove index rows whose files no longer exist")
+    refresh_cmd.add_argument("--rehash", action="store_true", help="re-hash every file instead of trusting size + modified time")
+
+    commands.add_parser("info", parents=[base], help="show where the index database is and what it contains")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] not in {"sort", "refresh", "info", "-h", "--help"}:
+        argv = ["sort", *argv]  # keep the original "sort_photos.py SOURCE DEST" form working
+    args = build_parser().parse_args(argv)
+    setup_logging(args.verbose, args.log_file)
+    if args.command == "refresh":
+        return refresh(args)
+    if args.command == "info":
+        return show_info(args)
+    return run(args)
+
+
+if __name__ == "__main__":
+    if hasattr(sys.stdout, "reconfigure"):  # avoid crashes on odd filenames in the Windows console
+        sys.stdout.reconfigure(errors="replace")
+        sys.stderr.reconfigure(errors="replace")
+    sys.exit(main())
