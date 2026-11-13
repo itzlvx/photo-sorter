@@ -1,0 +1,8 @@
+# Face scanning (phase 2). This installs the CPU version of ONNX Runtime.
+# NVIDIA GPU: do NOT add onnxruntime-gpu here. InsightFace brings in the CPU build, so after
+# installing this file run the two GPU commands from README.md ("Using your NVIDIA GPU").
+-r requirements.txt
+numpy>=1.26
+opencv-python-headless>=4.8
+onnxruntime>=1.17
+insightface>=0.7

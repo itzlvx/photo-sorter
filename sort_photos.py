@@ -12,12 +12,23 @@ Refresh mode rebuilds/updates the index from a library that is already sorted
 (also the starting point for face recognition on existing photos):
 
     python sort_photos.py refresh LIBRARY            # preview what would change
-    python sort_photos.py refresh LIBRARY --apply    # update the index
-    python sort_photos.py refresh LIBRARY --apply --prune   # also drop rows for deleted files
+    python sort_photos.py refresh LIBRARY --apply    # update the index; photos deleted from
+                                                     # disk are removed from it (with their faces)
+    python sort_photos.py refresh LIBRARY --apply --keep-missing   # do NOT remove rows for deleted files
 
 Show where the index database is, and what is in it:
 
     python sort_photos.py info
+
+Find faces in the indexed photos (phase 2; needs requirements-faces.txt):
+
+    python sort_photos.py faces                      # preview: how many photos would be scanned
+    python sort_photos.py faces --apply --limit 20   # try it on 20 photos first
+    python sort_photos.py faces --apply              # scan every photo not yet scanned
+
+Check that the NVIDIA GPU is really being used, and how much faster it is:
+
+    python sort_photos.py gpucheck
 
 Logging: key steps are always printed. Add -v for detailed (debug) output and
 --log-file FILE to also save a full debug log to a file.
@@ -68,6 +79,10 @@ TAG_DATETIME_DIGITIZED = 0x9004
 TAG_DATETIME = 0x0132
 DB_NAME = "photo_index.db"
 PROGRESS_EVERY = 200
+# Safety net for removing missing photos: if at least this many photos are missing AND they are
+# more than half of this library's indexed photos, it is probably a disconnected or damaged folder.
+MASS_MISSING_MIN = 10
+MASS_MISSING_FRACTION = 0.5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS photos (
@@ -82,6 +97,32 @@ CREATE TABLE IF NOT EXISTS photos (
     mtime_ns      INTEGER
 )
 """
+
+FACE_SCHEMA = [
+    # One row per photo that has been through face detection (even if no face was found).
+    """CREATE TABLE IF NOT EXISTS face_scans (
+        photo_id   INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
+        scanned_at TEXT NOT NULL,
+        model      TEXT NOT NULL,
+        face_count INTEGER NOT NULL,
+        error      TEXT
+    )""",
+    # One row per detected face. The box is 0..1 of the upright (EXIF-rotated) photo.
+    # embedding = 512 float32 values (2048 bytes), unit length; thumb = small JPEG.
+    """CREATE TABLE IF NOT EXISTS faces (
+        id        INTEGER PRIMARY KEY,
+        photo_id  INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+        x1 REAL NOT NULL, y1 REAL NOT NULL, x2 REAL NOT NULL, y2 REAL NOT NULL,
+        det_score REAL NOT NULL,
+        face_px   INTEGER NOT NULL,
+        blur      REAL,
+        yaw       REAL,
+        embedding BLOB NOT NULL,
+        thumb     BLOB,
+        model     TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_faces_photo ON faces(photo_id)",
+]
 
 log = logging.getLogger("photo_sorter")
 
@@ -319,6 +360,8 @@ def load_known_hashes(db_path: Path) -> set[str]:
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(SCHEMA)
+    for statement in FACE_SCHEMA:
+        conn.execute(statement)
     columns = {row[1] for row in conn.execute("PRAGMA table_info(photos)")}
     if "mtime_ns" not in columns:  # index created by an older version of this script
         log.info("Upgrading the index to the current format (adding mtime_ns)")
@@ -332,6 +375,7 @@ def open_index(db_path: Path) -> sqlite3.Connection:
     # separate *.db-journal file (OneDrive/antivirus can block that on Windows).
     conn.execute("PRAGMA journal_mode=MEMORY")
     conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")  # deleting a photo row also deletes its faces
     ensure_schema(conn)
     log.debug("Opened the index %s", db_path)
     return conn
@@ -485,6 +529,27 @@ def run(args: argparse.Namespace) -> int:
     return 1 if stats["errors"] else 0
 
 
+def count_faces_for(db_path: Path, photo_ids: list[int]) -> int:
+    """How many stored face records belong to these photos (0 if there are none or no face table)."""
+    if not photo_ids or not db_path.exists():
+        return 0
+    try:
+        conn = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+        try:
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='faces'").fetchone():
+                return 0
+            total = 0
+            for start in range(0, len(photo_ids), 500):  # stay under SQLite's variable limit
+                chunk = photo_ids[start:start + 500]
+                marks = ",".join("?" * len(chunk))
+                total += conn.execute(f"SELECT COUNT(*) FROM faces WHERE photo_id IN ({marks})", chunk).fetchone()[0]
+            return total
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return 0
+
+
 # --------------------------------------------------------------------------
 # refresh command: rebuild/refresh the index from an already-sorted library
 # --------------------------------------------------------------------------
@@ -498,7 +563,8 @@ def refresh(args: argparse.Namespace) -> int:
     - new files          -> added to the index (dated from EXIF/file date)
     - moved/renamed      -> path updated (matched by content hash)
     - extra copies       -> reported as duplicates, never touched
-    - files that are gone -> reported; removed from the index only with --prune
+    - files that are gone -> removed from the index together with their face records
+                            (unless --keep-missing; guarded against disconnected drives)
     Files whose path, size and modified time are unchanged are not re-hashed,
     so repeat refreshes of a big library are fast (use --rehash to force).
     """
@@ -510,7 +576,7 @@ def refresh(args: argparse.Namespace) -> int:
     db_path = (args.db or default_db_path()).resolve()
     log.info("=== Refresh started (%s) ===", "apply" if args.apply else "dry run")
     log.info("Library:  %s", library)
-    log.info("Options:  prune=%s, rehash=%s", args.prune, args.rehash)
+    log.info("Options:  remove missing photos from the index=%s, rehash=%s", not args.keep_missing, args.rehash)
     log_index_location(db_path, args.apply)
 
     conn = None
@@ -650,18 +716,36 @@ def refresh(args: argparse.Namespace) -> int:
     for r in missing:
         detail("MISSING  %s", r["path"])
 
-    pruned = 0
-    if args.prune and args.apply and missing:
+    # Decide whether the missing photos may be removed from the index.
+    removed = 0
+    removed_faces = 0
+    blocked: str | None = None
+    if missing and not args.keep_missing:
         if stats["errors"] or not stats["scanned"]:
-            log.warning(
-                "Skipping --prune: the scan had errors or found no photos "
-                "(is the drive connected?). Nothing was removed from the index."
+            blocked = "the scan had errors or found no photos (is the drive connected?)"
+        elif (
+            len(missing) >= MASS_MISSING_MIN
+            and len(missing) > MASS_MISSING_FRACTION * under_library
+            and not args.force_prune
+        ):
+            blocked = (
+                f"{len(missing)} of the {under_library} indexed photos in this library are missing (more than half), "
+                "which looks like a disconnected or damaged folder rather than deliberate deletions. "
+                "Check the library path; if you really did delete them, re-run with --force-prune"
             )
-        else:
-            log.info("Pruning %d index rows for files that no longer exist", len(missing))
+    removal_ids = [r["id"] for r in missing if r["id"] is not None]
+    if missing and not args.keep_missing and not blocked:
+        removed_faces = count_faces_for(db_path, removal_ids)
+        if args.apply:
+            log.info(
+                "Removing %d photos that no longer exist from the index (and their %d face records)",
+                len(missing), removed_faces,
+            )
             for r in missing:
-                write("DELETE FROM photos WHERE id = ?", (r["id"],))
-                pruned += 1
+                write("DELETE FROM photos WHERE id = ?", (r["id"],))  # face rows go with it (ON DELETE CASCADE)
+                removed += 1
+    if blocked:
+        log.warning("NOT removing missing photos from the index: %s.", blocked)
 
     if conn:
         conn.commit()
@@ -675,14 +759,19 @@ def refresh(args: argparse.Namespace) -> int:
     log.info("%-28s%d", "Moved/renamed:" if args.apply else "Would update (moved):", stats["moved"])
     log.info("%-28s%d", "Timestamps refreshed:", stats["timestamps_updated"])
     log.info("%-28s%d (extra copies, left alone)", "Duplicate files:", stats["duplicate_files"])
-    log.info("%-28s%d%s", "Missing from disk:", stats["missing"], f" (pruned {pruned})" if pruned else "")
+    log.info("%-28s%d", "Missing from disk:", stats["missing"])
+    if missing and not args.keep_missing and not blocked:
+        if args.apply:
+            log.info("%-28s%d (and %d face records)", "Removed from the index:", removed, removed_faces)
+        else:
+            log.info("%-28s%d (and %d face records)", "Would remove from index:", len(missing), removed_faces)
     log.info("%-28s%d", "Errors:", stats["errors"])
     if stats["index_errors"]:
         log.warning("Index write failures: %d (see the warning above)", stats["index_errors"])
     for key in sorted(k for k in stats if k.startswith("date:")):
         log.info("  new photos dated by %s: %d", key[5:], stats[key])
-    if stats["missing"] and not pruned:
-        log.info("  (rows for missing files are kept; add --apply --prune to remove them)")
+    if stats["missing"] and args.keep_missing:
+        log.info("  (--keep-missing: rows for missing files were left in the index)")
     log_index_location(db_path, args.apply)
     log.info("Finished in %.1f seconds", time.monotonic() - started)
     if not args.apply:
@@ -719,6 +808,17 @@ def show_info(args: argparse.Namespace) -> int:
             first, last = conn.execute("SELECT MIN(taken_at), MAX(taken_at) FROM photos").fetchone()
             if first:
                 log.info("Photos taken from %s to %s", first[:10], last[:10])
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if {"face_scans", "faces"} <= tables:
+                ok, failed = conn.execute(
+                    "SELECT COALESCE(SUM(error IS NULL), 0), COALESCE(SUM(error IS NOT NULL), 0) FROM face_scans"
+                ).fetchone()
+                with_faces = conn.execute("SELECT COUNT(DISTINCT photo_id) FROM faces").fetchone()[0]
+                face_total = conn.execute("SELECT COUNT(*) FROM faces").fetchone()[0]
+                log.info(
+                    "Face scan: %d of %d photos scanned (%d with faces, %d errors); %d faces stored",
+                    ok, total, with_faces, failed, face_total,
+                )
         finally:
             conn.close()
     except sqlite3.Error as error:
@@ -761,8 +861,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="refresh the index from an already-sorted library",
     )
     refresh_cmd.add_argument("library", type=Path, help="the sorted library folder (Year/Month folders)")
-    refresh_cmd.add_argument("--prune", action="store_true", help="with --apply: remove index rows whose files no longer exist")
+    refresh_cmd.add_argument("--keep-missing", action="store_true", help="do not remove index rows for photos that no longer exist on disk (they are removed by default)")
+    refresh_cmd.add_argument("--force-prune", action="store_true", help="allow removing missing photos even when more than half of the library is missing")
+    refresh_cmd.add_argument("--prune", action="store_true", help=argparse.SUPPRESS)  # old name, now the default behaviour
     refresh_cmd.add_argument("--rehash", action="store_true", help="re-hash every file instead of trusting size + modified time")
+
+    faces_cmd = commands.add_parser(
+        "faces", parents=[common],
+        help="find faces in the indexed photos and store face embeddings (phase 2)",
+    )
+    faces_cmd.add_argument("--limit", type=int, default=None, help="only scan this many photos (good for a first test)")
+    faces_cmd.add_argument("--rescan", action="store_true", help="scan every photo again, replacing earlier results")
+    faces_cmd.add_argument("--retry-errors", action="store_true", help="also retry photos that failed before")
+    hardware = faces_cmd.add_mutually_exclusive_group()
+    hardware.add_argument("--gpu", action="store_true", help="require the NVIDIA GPU (CUDA): stop with an explanation instead of quietly using the CPU")
+    hardware.add_argument("--cpu", action="store_true", help="ignore any GPU and use the CPU")
+    faces_cmd.add_argument("--det-size", type=int, default=640, help="detector input size, multiple of 32; bigger finds smaller faces but is slower (default 640)")
+    faces_cmd.add_argument("--min-score", type=float, default=0.5, help="minimum face detection confidence, 0-1 (default 0.5)")
+    faces_cmd.add_argument("--max-side", type=int, default=1600, help="shrink photos so the longest side is at most this many pixels (default 1600)")
+    faces_cmd.add_argument("--workers", type=int, default=3, help="background threads that load photos (default 3)")
+    faces_cmd.add_argument("--model", default="buffalo_l", help="InsightFace model pack (default buffalo_l; buffalo_s is faster but less accurate)")
+    faces_cmd.add_argument("--model-root", type=Path, default=None, help="where model files are kept (default ~/.insightface)")
+
+    gpucheck_cmd = commands.add_parser(
+        "gpucheck", parents=[base],
+        help="check that the NVIDIA GPU can be used for face scanning, with a timing test",
+    )
+    gpucheck_cmd.add_argument("--model", default="buffalo_l", help="InsightFace model pack (default buffalo_l)")
+    gpucheck_cmd.add_argument("--model-root", type=Path, default=None, help="where model files are kept (default ~/.insightface)")
+    gpucheck_cmd.add_argument("--det-size", type=int, default=640, help="detector input size used for the test (default 640)")
+    gpucheck_cmd.add_argument("--runs", type=int, default=5, help="timed runs per device (default 5)")
 
     commands.add_parser("info", parents=[base], help="show where the index database is and what it contains")
     return parser
@@ -770,7 +898,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    if argv and argv[0] not in {"sort", "refresh", "info", "-h", "--help"}:
+    if argv and argv[0] not in {"sort", "refresh", "info", "faces", "gpucheck", "-h", "--help"}:
         argv = ["sort", *argv]  # keep the original "sort_photos.py SOURCE DEST" form working
     args = build_parser().parse_args(argv)
     setup_logging(args.verbose, args.log_file)
@@ -778,6 +906,16 @@ def main(argv: list[str] | None = None) -> int:
         return refresh(args)
     if args.command == "info":
         return show_info(args)
+    if args.command in ("faces", "gpucheck"):
+        try:
+            import face_scan  # needs extra packages, so only loaded for these commands
+        except ImportError as error:
+            log.error(
+                "Face scanning needs extra packages (%s). Install them with: pip install -r requirements-faces.txt",
+                error,
+            )
+            return 2
+        return face_scan.gpu_check(args) if args.command == "gpucheck" else face_scan.scan_faces(args)
     return run(args)
 
 
