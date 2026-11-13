@@ -134,6 +134,7 @@ FACE_SCHEMA = [
     #   review      the AI is unsure; person_id (if set) is only its best guess. Shown to you in the UI.
     #   unassigned  no good match (usually a one-off face); not shown in the review queue
     #   confirmed   you checked it (set by the UI, never changed by the AI)
+    #   ignored     you dismissed it in the UI (not a face, a stranger...); the AI leaves it alone
     # reason says why a face is not 'auto' (low_quality, borderline, ambiguous, no_match, ...).
     """CREATE TABLE IF NOT EXISTS face_person (
         face_id     INTEGER PRIMARY KEY REFERENCES faces(id) ON DELETE CASCADE,
@@ -395,6 +396,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     if "mtime_ns" not in columns:  # index created by an older version of this script
         log.info("Upgrading the index to the current format (adding mtime_ns)")
         conn.execute("ALTER TABLE photos ADD COLUMN mtime_ns INTEGER")
+    person_columns = {row[1] for row in conn.execute("PRAGMA table_info(persons)")}
+    if "locked" not in person_columns:  # phase 4: people you merged or edited are protected from regrouping
+        conn.execute("ALTER TABLE persons ADD COLUMN locked INTEGER NOT NULL DEFAULT 0")
     conn.commit()
 
 
@@ -858,6 +862,8 @@ def show_info(args: argparse.Namespace) -> int:
                         people, named, by_status.get("auto", 0), by_status.get("confirmed", 0),
                         by_status.get("review", 0), by_status.get("unassigned", 0),
                     )
+                    if by_status.get("ignored"):
+                        log.info("  %d faces were ignored in the UI", by_status["ignored"])
         finally:
             conn.close()
     except sqlite3.Error as error:
@@ -948,13 +954,21 @@ def build_parser() -> argparse.ArgumentParser:
     cluster_cmd.add_argument("--max-yaw", type=float, default=45.0, help="faces turned more than this many degrees are low quality (default 45)")
     cluster_cmd.add_argument("--model", default=None, help="only use faces from this model pack (default: the one used most)")
 
+    ui_cmd = commands.add_parser(
+        "ui", parents=[base],
+        help="open the web interface to name people and review uncertain faces (phase 4)",
+    )
+    ui_cmd.add_argument("--host", default="127.0.0.1", help="address to listen on (default 127.0.0.1: only this computer can connect)")
+    ui_cmd.add_argument("--port", type=int, default=8765, help="port to listen on (default 8765)")
+    ui_cmd.add_argument("--no-browser", action="store_true", help="do not open the browser automatically")
+
     commands.add_parser("info", parents=[base], help="show where the index database is and what it contains")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    if argv and argv[0] not in {"sort", "refresh", "info", "faces", "gpucheck", "cluster", "-h", "--help"}:
+    if argv and argv[0] not in {"sort", "refresh", "info", "faces", "gpucheck", "cluster", "ui", "-h", "--help"}:
         argv = ["sort", *argv]  # keep the original "sort_photos.py SOURCE DEST" form working
     args = build_parser().parse_args(argv)
     setup_logging(args.verbose, args.log_file)
@@ -962,6 +976,13 @@ def main(argv: list[str] | None = None) -> int:
         return refresh(args)
     if args.command == "info":
         return show_info(args)
+    if args.command == "ui":
+        try:
+            import ui_server  # needs fastapi + uvicorn
+        except ImportError as error:
+            log.error("The web interface needs extra packages (%s). Install them with: pip install -r requirements-ui.txt", error)
+            return 2
+        return ui_server.run_ui(args)
     if args.command == "cluster":
         try:
             import face_cluster  # needs numpy only

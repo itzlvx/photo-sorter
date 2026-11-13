@@ -20,8 +20,9 @@ How the grouping works
         review      unsure (borderline similarity, two people look alike, or a
                     poor-quality face); the best guess is saved as a suggestion
         unassigned  no good match; not shown in the review queue
-     Nothing you decided in the UI is ever changed: named people and faces you
-     confirmed are kept, and new faces are matched against them.
+     Nothing you decided in the UI is ever changed: named people, merged people,
+     faces you confirmed and faces you ignored are kept, and new faces are
+     matched against them.
 
 Running it again is safe and cheap. By default it only places faces that are new
 or still uncertain, and leaves every confident (auto) face where it is.
@@ -134,6 +135,7 @@ def load_faces(conn: sqlite3.Connection, model: str, args) -> FaceData:
 @dataclass
 class State:
     persons: dict[int, str | None] = field(default_factory=dict)       # person id -> name
+    locked: set[int] = field(default_factory=set)                      # people protected in the UI (merged, edited)
     rows: dict[int, tuple[int | None, str]] = field(default_factory=dict)  # face id -> (person id, status)
     rejected: dict[int, set[int]] = field(default_factory=dict)        # face id -> person ids it is NOT
 
@@ -142,6 +144,8 @@ def load_state(conn: sqlite3.Connection) -> State:
     state = State()
     if has_table(conn, "persons"):
         state.persons = {pid: name for pid, name in conn.execute("SELECT id, name FROM persons")}
+        if "locked" in {row[1] for row in conn.execute("PRAGMA table_info(persons)")}:
+            state.locked = {pid for (pid,) in conn.execute("SELECT id FROM persons WHERE locked = 1")}
     if has_table(conn, "face_person"):
         state.rows = {fid: (pid, status) for fid, pid, status in conn.execute("SELECT face_id, person_id, status FROM face_person")}
     if has_table(conn, "face_rejections"):
@@ -326,14 +330,20 @@ def make_plan(data: FaceData, state: State, args) -> Plan:
     # --- what the human already decided, and what the AI did last time ---------
     named = {pid for pid, name in state.persons.items() if name and name.strip()}
     confirmed_people = {pid for pid, status in state.rows.values() if status == "confirmed" and pid is not None}
-    locked_ids = named | confirmed_people
+    locked_ids = named | confirmed_people | state.locked
 
     kept = np.zeros(n, dtype=bool)
+    ignored = np.zeros(n, dtype=bool)     # dismissed by you in the UI: never placed again
     kept_person = np.full(n, -1, dtype=np.int64)
     kept_by_status: Counter = Counter()
     for fid, (pid, status) in state.rows.items():
         i = index_of.get(fid)
-        if i is None or pid is None or pid not in state.persons:
+        if i is None:
+            continue
+        if status == "ignored":
+            ignored[i] = True
+            continue
+        if pid is None or pid not in state.persons:
             continue
         keep = status == "confirmed" or (status == "auto" and (not args.recluster or pid in locked_ids))
         if keep:
@@ -356,7 +366,7 @@ def make_plan(data: FaceData, state: State, args) -> Plan:
     seed_count = groups.n
     seed_sizes = {k: int(groups.counts[k]) for k in range(seed_count)}  # before any new face joins
 
-    pending = np.nonzero(~kept)[0]
+    pending = np.nonzero(~kept & ~ignored)[0]
     rejected_idx = {index_of[f]: p for f, p in state.rejected.items() if f in index_of and not kept[index_of[f]]}
 
     # --- 1. form groups from the good-quality pending faces, best first -------

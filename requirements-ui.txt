@@ -1,0 +1,5 @@
+# Extra packages for the web interface (phase 4): python sort_photos.py ui
+-r requirements.txt
+numpy>=1.26
+fastapi>=0.110
+uvicorn>=0.29

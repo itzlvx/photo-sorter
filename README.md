@@ -182,7 +182,52 @@ are. If many faces land in `review`, check a few groups in the UI, adjust the op
 `--recluster`. Children change a lot as they grow, so expect one child to appear as two or three groups
 (different ages); the UI will let you merge them.
 
+## Phase 4: the web interface (name people, review uncertain faces)
+
+    pip install -r requirements-ui.txt       # once: fastapi + uvicorn
+    python sort_photos.py ui                 # opens http://127.0.0.1:8765 in your browser
+
+Keep the `web` folder next to `ui_server.py`. Close the window running the command (or press Ctrl+C) to stop it.
+Everything stays on this computer: the page only talks to this program, and the program only talks to the index.
+
+When you open it, you land in **Review** if the AI has questions for you, otherwise in **People**.
+
+- **People:** one contact strip per person (four faces, so a wrong group is obvious at a glance). Type a name under the
+  strip. Search, or filter to unnamed people. Typing a name that already exists offers to merge the two groups.
+- **A person:** every face in the group, weakest matches first (the likeliest mistakes). Click faces to select them
+  (shift-click for a range), then **Move to…**, **Not this person**, **Ignore** or **Confirm they're right**. The
+  expand button on a face shows the whole photo with the face outlined, and where the file is. **Might be the same
+  person** lists groups that look alike (a child at two ages, for example) with a one-click merge, and
+  **Merge into another person…** merges this group into one you choose.
+- **Review:** faces the AI wasn't sure about, grouped by who it thinks they are. Select the ones that are right and
+  **Confirm as …**; select the wrong ones and choose **Not …** (the AI will never suggest that person for those faces
+  again) or **Move to…** the right person.
+- **Unassigned:** faces with no match, mostly strangers. Move the ones that matter to a person, **Ignore** the rest.
+- **Ignored:** faces you dismissed. They are never placed again unless you restore them.
+- **Place new faces** (bottom left) runs the phase 3 grouping for new and uncertain faces, so after you name a few
+  people the remaining faces are matched against them.
+
+Your decisions are protected: named people, merged people, confirmed faces and ignored faces are never moved by
+`cluster`, even with `--recluster`. Moving faces always counts as confirmed by you. Unnamed groups that become empty
+are removed. There is no undo button; to reverse a move, move the faces back.
+
+Privacy and safety:
+- It only answers requests for `127.0.0.1` / `localhost`, and every change needs a header that other websites can't
+  send, so a web page you visit can't read or change your face data.
+- `--host 0.0.0.0` would expose it to your network **with no password**; the program warns you. Don't, unless you
+  trust everyone on that network.
+- `--port` changes the port (default 8765), `--no-browser` stops it opening a browser tab.
+
+### The whole workflow
+
+    python sort_photos.py sort SOURCE DEST --apply     # or: refresh DEST --apply for a library that is already sorted
+    python sort_photos.py faces --apply                # find faces (use the GPU if you set it up)
+    python sort_photos.py cluster --apply              # group them into people
+    python sort_photos.py ui                           # name people, review, merge
+    # later, after adding photos: sort/refresh, faces --apply, then "Place new faces" in the UI (or cluster --apply)
+
 ## Roadmap
 - Phase 2: InsightFace detection + embeddings stored in SQLite (done)
 - Phase 3: clustering, with low-confidence faces flagged for review (done)
-- Phase 4: FastAPI web UI to name people and work the review queue
+- Phase 4: web interface to name people and work the review queue (done)
+- Ideas not built yet: searching photos by person, writing people's names into photo metadata or folders, an undo button
