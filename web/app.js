@@ -719,7 +719,7 @@ async function viewPhotos(params) {
 
   // quick filters
   const quick = [["", "All photos", lib.total], ["unlabeled", "Unlabeled faces", lib.counts.unlabeled], ["review", "Needs review", lib.counts.review],
-    ["noface", "No faces", lib.counts.noface], ["unscanned", "Not scanned yet", lib.counts.unscanned]]
+    ["noface", "No faces", lib.counts.noface], ["unscanned", "Not scanned yet", lib.counts.unscanned], ["notes", "Has notes", lib.counts.notes || 0]]
     .filter(([value, , count]) => value === "" || value === f.filter || count > 0);
   const seg = h("div", { class: "seg", role: "group", "aria-label": "Quick filters" }, ...quick.map(([value, label, count]) =>
     h("button", { type: "button", "aria-pressed": String(f.filter === value), onclick: () => go({ filter: value }) }, label, " ", h("span", { class: "count", text: count.toLocaleString() }))));
@@ -763,7 +763,7 @@ async function viewPhotos(params) {
   const monthSel = h("select", { class: "field", "aria-label": "Month", disabled: !f.year, onchange: (e) => go({ month: e.target.value }) },
     h("option", { value: "", text: "All months" }),
     ...months.slice().sort((a, b) => a.month.localeCompare(b.month)).map((m) => h("option", { value: m.month, selected: f.month === m.month, text: `${MONTHS[Number(m.month) - 1] || m.month} (${m.count.toLocaleString()})` })));
-  const search = h("input", { class: "field", type: "search", value: f.q, placeholder: "File or folder name", "aria-label": "Search file or folder names", onchange: (e) => go({ q: e.target.value.trim() }) });
+  const search = h("input", { class: "field", type: "search", value: f.q, placeholder: "Name, folder or note", "aria-label": "Search file names, folders and notes", onchange: (e) => go({ q: e.target.value.trim() }) });
   const orderSel = h("select", { class: "field", "aria-label": "Order", onchange: (e) => go({ order: e.target.value }) },
     h("option", { value: "new", text: "Newest first", selected: f.order === "new" }), h("option", { value: "old", text: "Oldest first", selected: f.order === "old" }));
 
@@ -830,7 +830,7 @@ async function openViewer(start) {
   const close = h("button", { class: "btn", type: "button", text: "Close", onclick: () => dialog.close() });
   const dialog = openDialog(h("div", { class: "viewer" }, frame, side,
     h("div", { class: "vbar" }, prev, next, position, h("span", { class: "spacer" }), close)), { wide: true,
-    onClose: () => { document.removeEventListener("keydown", onKey); if (imageUrl) URL.revokeObjectURL(imageUrl); } });
+    onClose: () => { document.removeEventListener("keydown", onKey); if (imageUrl) URL.revokeObjectURL(imageUrl); saveNote(); } });
   dialog.classList.add("viewer-dialog");
   // listen on the document: focus falls back to <body> whenever the photo is swapped
   const onKey = (e) => {
@@ -840,7 +840,10 @@ async function openViewer(start) {
   };
   document.addEventListener("keydown", onKey);
 
+  let saveNote = () => {};   // saves the note being typed (set by show); called before leaving a photo
+
   async function step(delta) {
+    saveNote();
     const target = index + delta;
     if (target < 0) return;
     if (target >= state.photoList.length) { if (!(state.loadMorePhotos && await state.loadMorePhotos()) || target >= state.photoList.length) return; }
@@ -898,7 +901,63 @@ async function openViewer(start) {
     show(Math.min(index, state.photoList.length - 1));
   }
 
+  function cameraBlock(camera) {
+    if (!camera) return h("p", { class: "vcam count", text: "Camera details not read yet (they are read by the next refresh)." });
+    if (camera.error) return h("p", { class: "vcam count", text: "Camera details could not be read from this file." });
+    const lines = [];
+    const body = [camera.camera, camera.lens].filter(Boolean).join(" · ");
+    if (body) lines.push(h("div", { class: "t", text: body }));
+    if (camera.settings) lines.push(h("div", { text: camera.settings }));
+    if (camera.width && camera.height) lines.push(h("div", { text: `${camera.width.toLocaleString()} × ${camera.height.toLocaleString()} pixels` }));
+    if (camera.latitude != null && camera.longitude != null) {
+      const alt = camera.altitude_m != null ? `, ${Math.round(camera.altitude_m)} m` : "";
+      lines.push(h("div", { class: "vgps", text: `Location ${camera.latitude.toFixed(5)}, ${camera.longitude.toFixed(5)}${alt}` }));
+    }
+    if (!lines.length) lines.push(h("div", { class: "count", text: "No camera details in this file." }));
+    return h("div", { class: "vcam" }, ...lines);
+  }
+
+  function annotationBlock(items) {
+    if (!items.length) return [];
+    const byKind = new Map();
+    for (const a of items) { if (!byKind.has(a.kind)) byKind.set(a.kind, []); byKind.get(a.kind).push(a); }
+    const titles = { tag: "Tags", caption: "Description", ocr: "Text in the photo", note: "Notes" };
+    const out = [];
+    for (const [kind, list] of byKind) {
+      out.push(h("h3", { text: titles[kind] || kind }));
+      if (kind === "tag") out.push(h("p", { class: "vtags" }, ...list.map((a) => h("span", { class: "chip tag", text: a.text, title: a.source }))));
+      else for (const a of list) out.push(h("p", { class: "vnote-text", text: a.text, title: a.source }));
+    }
+    return out;
+  }
+
+  function noteBlock(photo, detail) {
+    let saved = detail.note || "";
+    const status = h("span", { class: "count", "aria-live": "polite" });
+    const box = h("textarea", { class: "field vnote", rows: "3", maxlength: "4000", placeholder: "Add a note: who, where, what happened. You can search for it on the Photos page.", "aria-label": "Your note on this photo" });
+    box.value = saved;
+    const mine = viewerToken;
+    async function save() {
+      const text = box.value;
+      if (text.trim() === saved.trim()) return;
+      status.textContent = "Saving…";
+      try {
+        const result = await api(`/api/photos/${photo.id}/note`, { body: { text } });
+        saved = result.note;
+        if (mine === viewerToken) { box.value = saved; status.textContent = saved ? "Saved" : "Note removed"; }
+        else toast(saved ? "Note saved" : "Note removed");
+      } catch (e) { status.textContent = ""; toast(e.message, "error"); }
+    }
+    saveNote = save;
+    box.addEventListener("blur", save);
+    box.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); save(); } });
+    box.addEventListener("input", () => { status.textContent = box.value.trim() === saved.trim() ? "" : "Not saved yet"; });
+    return h("div", { class: "vnotes" }, h("h3", { text: "Your note" }), box,
+      h("div", { class: "row" }, status, h("span", { class: "spacer" }), h("button", { class: "btn quiet", type: "button", text: "Save note", onclick: save })));
+  }
+
   async function show(n) {
+    saveNote = () => {};
     index = n;
     const mine = ++viewerToken;
     const photo = state.photoList[index];
@@ -943,7 +1002,10 @@ async function openViewer(start) {
       h("h2", { text: detail.name }),
       h("p", { class: "vmeta", text: `${detail.taken_at ? "Taken " + detail.taken_at.replace("T", " ") : "No date"} (${detail.date_source})` }),
       h("p", { class: "vpath", text: detail.path }),
+      cameraBlock(detail.camera),
       h("h3", { text: rows.length ? "People in this photo" : (detail.scanned ? "No faces found" : "Faces not scanned yet") }), ...rows,
+      ...annotationBlock(detail.annotations || []),
+      noteBlock(photo, detail),
       h("div", { class: "vactions" },
         h("button", { class: "btn", type: "button", text: "Rename", onclick: () => renamePhoto(photo, detail) }),
         h("button", { class: "btn danger", type: "button", text: "Delete photo", onclick: () => deletePhoto(photo, detail) })));

@@ -7,6 +7,7 @@ Adds these routes to the web interface (see ui_server.py):
   GET /api/photos/{id}/image      larger picture for the viewer
   GET /api/library                years and months with counts, and the counts for the quick filters
   GET /api/people/chips           named people with how many photos they are in (the quick links)
+  POST /api/photos/{id}/note      save your note on a photo (phase 6; searchable from the Photos page)
   POST /api/photos/{id}/rename    give the file a new name (same folder, same extension)
   POST /api/photos/delete         delete several photos at once (same as below, one by one)
   POST /api/photos/{id}/delete    move the file to a '.photo-sorter-trash' folder and drop it from the index
@@ -29,6 +30,7 @@ from fastapi.responses import FileResponse, Response
 from PIL import Image, ImageOps
 from pydantic import BaseModel
 
+import photo_meta
 import sort_photos as sp  # also registers HEIC support
 
 BAD_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -38,6 +40,10 @@ MAX_NAME = 150
 
 class NameBody(BaseModel):
     name: str
+
+
+class NoteBody(BaseModel):
+    text: str = ""
 
 
 class PhotoIds(BaseModel):
@@ -95,6 +101,8 @@ FILTERS = {
     ),
     "noface": "EXISTS (SELECT 1 FROM face_scans s WHERE s.photo_id = ph.id AND s.face_count = 0 AND s.error IS NULL)",
     "unscanned": "NOT EXISTS (SELECT 1 FROM face_scans s WHERE s.photo_id = ph.id)",
+    # phase 6: photos you wrote a note on
+    "notes": f"EXISTS (SELECT 1 FROM photo_annotations a WHERE a.photo_id = ph.id AND a.kind = 'note' AND a.source = '{photo_meta.YOU}')",
 }
 
 
@@ -173,16 +181,33 @@ def add_photo_routes(app: FastAPI, get_db, thumb_dir: Path) -> None:
             " WHERE f.photo_id = ? ORDER BY f.x1", (photo_id,),
         ).fetchall()
         scanned = db.execute("SELECT 1 FROM face_scans WHERE photo_id = ?", (photo_id,)).fetchone() is not None
+        camera = photo_meta.camera_json(db.execute("SELECT * FROM photo_exif WHERE photo_id = ?", (photo_id,)).fetchone())
+        annotations = photo_meta.annotations_for(db, photo_id)
+        note = next((a["text"] for a in annotations if a["kind"] == "note" and a["source"] == photo_meta.YOU), "")
         return {
             "id": row["id"], "path": row["sorted_path"], "name": file_name(row["sorted_path"]),
             "taken_at": row["taken_at"], "date_source": row["date_source"], "size_bytes": row["size_bytes"],
             "scanned": scanned,
+            "camera": camera,
+            "note": note,
+            "annotations": [a for a in annotations if not (a["kind"] == "note" and a["source"] == photo_meta.YOU)],
             "faces": [
                 {"id": f["id"], "box": [f["x1"], f["y1"], f["x2"], f["y2"]], "status": f["status"] or "",
                  "person_id": f["person_id"], "name": f["name"] or ""}
                 for f in faces
             ],
         }
+
+    # ---------------------------------------------------------------------- note
+    @app.post("/api/photos/{photo_id}/note")
+    def save_note(photo_id: int, body: NoteBody, db: sqlite3.Connection = Depends(get_db)):
+        photo_row(db, photo_id)
+        try:
+            with db:
+                text = photo_meta.set_note(db, photo_id, body.text)
+        except ValueError as error:
+            raise HTTPException(400, str(error))
+        return {"id": photo_id, "note": text}
 
     # ------------------------------------------------------------ rename and delete
     @app.post("/api/photos/{photo_id}/rename")
@@ -300,9 +325,11 @@ def add_photo_routes(app: FastAPI, get_db, thumb_dir: Path) -> None:
             if month:
                 where.append("substr(ph.taken_at, 6, 2) = ?")
                 params.append(month.zfill(2))
-        for word in q.split()[:6]:                   # file or folder name contains every word
-            where.append("ph.sorted_path LIKE ? ESCAPE '\\' COLLATE NOCASE")
-            params.append("%" + word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%")
+        use_fts = photo_meta.has_search(db) if q.strip() else False
+        for word in q.split()[:6]:                   # every word is in the file/folder name, or in the notes and tags
+            condition, values = photo_meta.word_condition(word, use_fts)
+            where.append(condition)
+            params += values
         clause = (" WHERE " + " AND ".join(where)) if where else ""
         direction = "ASC" if order == "old" else "DESC"
         total = db.execute(f"SELECT COUNT(*) FROM photos ph{clause}", params).fetchone()[0]

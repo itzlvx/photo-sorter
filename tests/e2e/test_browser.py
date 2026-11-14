@@ -67,6 +67,40 @@ def test_viewer_opens_navigates_and_closes_with_the_keyboard(page, site):
     assert page.locator(".vimg").count() == 0
 
 
+def test_write_a_note_then_find_the_photo_by_it(page, site):
+    open_photos(page, site)
+    page.locator(".photo").first.locator(".pbody").click()
+    page.wait_for_selector(".vimg")
+    name = page.inner_text(".vside h2")
+    assert "Camera details not read yet" in page.inner_text(".vside")
+    note = page.get_by_label("Your note on this photo")
+    note.fill("Grandma's birthday at Lake Placid")
+    page.keyboard.press("ArrowRight")                    # arrow keys type in the note; they don't change the photo
+    assert page.inner_text(".vside h2") == name
+    page.get_by_role("button", name="Save note").click()
+    page.wait_for_selector(".vnotes :text('Saved')")
+    page.get_by_role("button", name="Next →").click()   # leaving and coming back shows the saved note
+    page.wait_for_timeout(300)
+    page.get_by_role("button", name="← Previous").click()
+    page.wait_for_function("document.querySelector('.vnote') && document.querySelector('.vnote').value.includes('Placid')")
+    note = page.get_by_label("Your note on this photo")
+    note.fill(note.input_value() + " 2024")              # an unsaved edit is saved when the viewer closes
+    page.get_by_role("button", name="Close").click()
+    page.wait_for_timeout(500)
+    search = page.get_by_label("Search file names, folders and notes")
+    search.fill("placid")
+    search.press("Enter")
+    page.wait_for_function("document.querySelectorAll('.photos .photo').length === 1")
+    page.locator(".photo").first.locator(".pbody").click()
+    page.wait_for_selector(".vimg")
+    assert page.inner_text(".vside h2") == name
+    assert page.get_by_label("Your note on this photo").input_value() == "Grandma's birthday at Lake Placid 2024"
+    page.get_by_role("button", name="Close").click()
+    page.goto(f"{site.url}/#/photos")
+    page.wait_for_selector(".photo")
+    assert "Has notes 1" in page.inner_text(".seg")
+
+
 def test_rename_asks_first_and_can_be_cancelled(page, site):
     open_photos(page, site)
     page.locator(".photo").first.locator(".pbody").click()

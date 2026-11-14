@@ -251,6 +251,37 @@ Thumbnails are made the first time you look at a photo and cached in a `thumbs` 
 (`%LOCALAPPDATA%\photo-sorter\thumbs`), so they are quick afterwards. The first screen of a large library on a network
 drive can take a little while to appear. Your original photos are only ever read. Deleting the `thumbs` folder is safe.
 
+### Phase 6: camera details, notes and search
+
+The index now keeps information about each photo that is not about faces:
+
+- **Camera details** (make, model, lens, aperture, shutter speed, ISO, focal length, pixel size and GPS position) are
+  read when `sort` or `refresh` adds a photo, from the same file read that finds its date, so it costs nothing extra.
+  For photos indexed before this existed, the next `refresh --apply` reads them once (add `--no-metadata` to skip
+  that). You can also do it on its own, in steps if your library is big:
+
+      python sort_photos.py metadata                    # preview: how many photos have no camera details yet
+      python sort_photos.py metadata --apply --limit 500
+      python sort_photos.py metadata --apply            # the rest (Ctrl+C is safe; run it again to continue)
+      python sort_photos.py metadata --apply --reread   # read every photo again
+
+  The photo viewer shows them under the file path. Rotated photos report their upright size.
+- **Your notes.** The viewer has a *Your note* box ("Grandma's 80th, Lake Placid"). It saves when you click *Save note*,
+  press Ctrl+Enter, move to another photo or close the viewer. Clearing the box removes the note.
+- **Search.** The search box on the Photos page now matches file names, folders **and notes** (every word you type must
+  match; note words match from their start, so `plac` finds *Placid*, and accents are ignored). The *Has notes* quick
+  filter shows every photo you wrote a note on.
+- `info` reports how many photos have camera details, GPS positions and notes.
+
+Notes, camera details and (later) tags, captions and search vectors belong to the photo's entry in the index. They
+follow the photo when `refresh` notices it was moved or renamed, and they are removed with it when the photo is deleted
+in the web interface or removed by `refresh` because the file is gone (just like its faces).
+
+For later phases the index also has a place for search vectors (`photo_embeddings`, one per photo per model) and for
+tags, captions and text found in photos (`photo_annotations`). Anything a program writes there is labelled with that
+program's name, and re-running it replaces only its own rows, so your notes are never overwritten. Searching uses
+SQLite's built-in full-text index; if your Python's SQLite lacks it, search still works, just more slowly.
+
 ### The whole workflow
 
     python sort_photos.py sort SOURCE DEST --apply     # or: refresh DEST --apply for a library that is already sorted

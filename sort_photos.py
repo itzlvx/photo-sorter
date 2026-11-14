@@ -20,6 +20,11 @@ Show where the index database is, and what is in it:
 
     python sort_photos.py info
 
+Read camera details (make, model, lens, exposure, size, GPS) for photos indexed before they
+were recorded (sort and refresh record them for new photos; refresh also fills the gaps):
+
+    python sort_photos.py metadata --apply
+
 Find faces in the indexed photos (phase 2; needs requirements-faces.txt):
 
     python sort_photos.py faces                      # preview: how many photos would be scanned
@@ -56,6 +61,8 @@ from datetime import datetime
 from pathlib import Path
 
 from PIL import Image
+
+import photo_meta  # phase 6: camera details, notes/tags, embeddings, search index
 
 try:  # HEIC/HEIF support (iPhone photos)
     from pillow_heif import register_heif_opener
@@ -242,7 +249,8 @@ def parse_exif_date(value) -> datetime | None:
     return None
 
 
-def read_exif_date(path: Path) -> tuple[datetime, str] | None:
+def read_exif_details(path: Path) -> tuple[tuple[datetime, str] | None, dict | None, str | None]:
+    """Open the photo once: (EXIF date and its source or None, camera details or None, error or None)."""
     try:
         with Image.open(path) as img:
             exif = img.getexif()
@@ -252,14 +260,19 @@ def read_exif_date(path: Path) -> tuple[datetime, str] | None:
                 (exif_ifd.get(TAG_DATETIME_DIGITIZED), "exif_digitized"),
                 (exif.get(TAG_DATETIME), "exif_modified"),
             )
+            fields = photo_meta.exif_fields(img)
     except Exception as error:  # corrupt or unusual files raise many different errors
         log.debug("Could not read EXIF from %s: %s", path.name, error)
-        return None
+        return None, None, (str(error) or type(error).__name__)[:300]
     for raw, label in candidates:
         parsed = parse_exif_date(raw)
         if parsed:
-            return parsed, label
-    return None
+            return (parsed, label), fields, None
+    return None, fields, None
+
+
+def read_exif_date(path: Path) -> tuple[datetime, str] | None:
+    return read_exif_details(path)[0]
 
 
 def file_system_date(path: Path) -> datetime:
@@ -272,6 +285,13 @@ def file_system_date(path: Path) -> datetime:
 
 def get_taken_date(path: Path) -> tuple[datetime, str]:
     return read_exif_date(path) or (file_system_date(path), "file_date")
+
+
+def read_photo_details(path: Path) -> tuple[datetime, str, dict | None, str | None]:
+    """Date taken, where the date came from, camera details and a read error, from one opening of the file."""
+    found, fields, error = read_exif_details(path)
+    taken, date_source = found or (file_system_date(path), "file_date")
+    return taken, date_source, fields, error
 
 
 # --------------------------------------------------------------------------
@@ -395,6 +415,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(SCHEMA)
     for statement in FACE_SCHEMA:
         conn.execute(statement)
+    photo_meta.ensure_meta_schema(conn)
     columns = {row[1] for row in conn.execute("PRAGMA table_info(photos)")}
     if "mtime_ns" not in columns:  # index created by an older version of this script
         log.info("Upgrading the index to the current format (adding mtime_ns)")
@@ -417,7 +438,7 @@ def open_index(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def record_photo(conn, sha, src, target, taken, date_source) -> None:
+def record_photo(conn, sha, src, target, taken, date_source, fields=None, read_error=None) -> None:
     stat = target.stat()
     row = (
         sha,
@@ -436,6 +457,7 @@ def record_photo(conn, sha, src, target, taken, date_source) -> None:
                 " taken_at, date_source, size_bytes, sorted_at, mtime_ns) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 row,
             )
+            conn.execute(photo_meta.SAVE_EXIF_BY_SHA, (photo_meta.now(), *photo_meta.exif_values(fields), read_error, sha))
             conn.commit()
             return
         except sqlite3.OperationalError as error:
@@ -504,7 +526,7 @@ def run(args: argparse.Namespace) -> int:
                 detail("SKIP (duplicate)  %s", src)
                 continue
 
-            taken, date_source = get_taken_date(src)
+            taken, date_source, fields, read_error = read_photo_details(src)
             log.debug("Date for %s: %s (from %s)", src.name, taken.isoformat(timespec="seconds"), date_source)
             folder = dest / f"{taken.year:04d}" / month_folder(taken.month, args.month_format)
             target, is_duplicate = choose_destination(folder, src.name, sha, reserved)
@@ -519,7 +541,7 @@ def run(args: argparse.Namespace) -> int:
                 transfer(src, target, args.move, sha)
                 log.debug("%s complete: %s", verb.title(), target)
                 try:
-                    record_photo(conn, sha, src, target, taken, date_source)
+                    record_photo(conn, sha, src, target, taken, date_source, fields, read_error)
                     log.debug("Index row written for %s", target.name)
                 except sqlite3.Error as error:
                     stats["index_errors"] += 1
@@ -563,6 +585,27 @@ def run(args: argparse.Namespace) -> int:
     if not args.apply:
         log.info("Dry run only: nothing was changed. Re-run with --apply to sort for real.")
     return 1 if stats["errors"] else 0
+
+
+def exif_ids(conn: sqlite3.Connection) -> set[int]:
+    """Ids of photos whose camera details were already read."""
+    try:
+        return {row[0] for row in conn.execute("SELECT photo_id FROM photo_exif")}
+    except sqlite3.Error:
+        return set()
+
+
+def exif_ids_read_only(db_path: Path) -> set[int]:
+    if not db_path.exists():
+        return set()
+    try:
+        conn = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return set()
+    try:
+        return exif_ids(conn)
+    finally:
+        conn.close()
 
 
 def count_faces_for(db_path: Path, photo_ids: list[int]) -> int:
@@ -692,7 +735,7 @@ def refresh(args: argparse.Namespace) -> int:
             known = by_sha.get(sha)
 
             if known is None:
-                taken, date_source = get_taken_date(path)
+                taken, date_source, fields, read_error = read_photo_details(path)
                 log.debug("Date for %s: %s (from %s)", path.name, taken.isoformat(timespec="seconds"), date_source)
                 new_row = {"id": None, "sha": sha, "path": str(path), "size": size, "mtime": mtime}
                 by_sha[sha] = new_row
@@ -708,6 +751,7 @@ def refresh(args: argparse.Namespace) -> int:
                         date_source, size, datetime.now().isoformat(timespec="seconds"), mtime,
                     ),
                 )
+                write(photo_meta.SAVE_EXIF_BY_SHA, (photo_meta.now(), *photo_meta.exif_values(fields), read_error, sha))
             elif _norm(known["path"]) == key:
                 if known["size"] != size or known["mtime"] != mtime:
                     stats["timestamps_updated"] += 1
@@ -743,6 +787,27 @@ def refresh(args: argparse.Namespace) -> int:
         "Scan complete: %d photos found, %d hashed, %d skipped as unchanged",
         stats["scanned"], hashed, stats["unchanged"],
     )
+
+    # Camera details for photos indexed before phase 6 (each file is read once; later refreshes skip them).
+    unread: list[dict] = []
+    if not args.no_metadata:
+        have = exif_ids(conn) if conn else exif_ids_read_only(db_path)
+        unread = [
+            r for r in by_sha.values()
+            if r["id"] is not None and r["id"] not in have and r["sha"] in seen_shas
+            and _norm(r["path"]).startswith(root + os.sep)
+        ]
+    stats["metadata_todo"] = len(unread)
+    if unread and args.apply:
+        log.info("Reading camera details for %d photos indexed before they were recorded ...", len(unread))
+        for done, r in enumerate(unread, 1):
+            _, fields, read_error = read_exif_details(Path(r["path"]))
+            if read_error:
+                stats["metadata_errors"] += 1
+            write(photo_meta.SAVE_EXIF, (r["id"], photo_meta.now(), *photo_meta.exif_values(fields), read_error))
+            stats["metadata_read"] += 1
+            if done % PROGRESS_EVERY == 0:
+                log.info("Progress: camera details read for %d of %d photos", done, len(unread))
 
     missing = [
         r for r in original_rows
@@ -795,6 +860,11 @@ def refresh(args: argparse.Namespace) -> int:
     log.info("%-28s%d", "Moved/renamed:" if args.apply else "Would update (moved):", stats["moved"])
     log.info("%-28s%d", "Timestamps refreshed:", stats["timestamps_updated"])
     log.info("%-28s%d (extra copies, left alone)", "Duplicate files:", stats["duplicate_files"])
+    if args.apply:
+        if stats["metadata_read"]:
+            log.info("%-28s%d (%d could not be read)", "Camera details read:", stats["metadata_read"], stats["metadata_errors"])
+    elif stats["metadata_todo"]:
+        log.info("%-28s%d", "Camera details to read:", stats["metadata_todo"])
     log.info("%-28s%d", "Missing from disk:", stats["missing"])
     if missing and not args.keep_missing and not blocked:
         if args.apply:
@@ -813,6 +883,79 @@ def refresh(args: argparse.Namespace) -> int:
     if not args.apply:
         log.info("Dry run only: the index was not changed. Re-run with --apply to update it.")
     return 1 if stats["errors"] or stats["index_errors"] else 0
+
+
+# --------------------------------------------------------------------------
+# metadata command: read camera details for photos already in the index
+# --------------------------------------------------------------------------
+def read_metadata(args: argparse.Namespace) -> int:
+    """Read camera make/model, lens, exposure, size and GPS for indexed photos that don't have them yet."""
+    started = time.monotonic()
+    db_path = (args.db or default_db_path()).resolve()
+    log.info("=== Camera details (%s) ===", "apply" if args.apply else "dry run")
+    log_index_location(db_path, args.apply)
+    if not db_path.exists():
+        log.error("There is no index yet. Run 'sort ... --apply' or 'refresh ... --apply' first.")
+        return 2
+    try:
+        conn = open_index(db_path) if args.apply else sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+    except (OSError, sqlite3.Error) as error:
+        log.error("Cannot open the index %s: %s", db_path, error)
+        return 2
+    stats: Counter[str] = Counter()
+    fixed = 0
+    try:
+        have = set() if args.reread else exif_ids(conn)
+        rows = [(pid, path) for pid, path in conn.execute("SELECT id, sorted_path FROM photos ORDER BY id") if pid not in have]
+        total = len(rows)
+        if args.limit is not None:
+            rows = rows[: max(0, args.limit)]
+        log.info("%d photos %s", total, "in the index" if args.reread else "have no camera details yet")
+        if not args.apply:
+            log.info("Would read %d photos. Re-run with --apply to read them.", len(rows))
+            return 0
+        try:
+            for done, (photo_id, path_text) in enumerate(rows, 1):
+                path = Path(path_text)
+                if not path.is_file():
+                    stats["missing"] += 1
+                    log.debug("Not on disk any more: %s", path)
+                    continue
+                _, fields, read_error = read_exif_details(path)
+                photo_meta.save_exif(conn, photo_id, fields, read_error)
+                stats["read"] += 1
+                if read_error:
+                    stats["errors"] += 1
+                    log.warning("Could not read %s: %s", path, read_error)
+                elif fields and fields.get("latitude") is not None:
+                    stats["gps"] += 1
+                if fields and (fields.get("make") or fields.get("model")):
+                    stats["camera"] += 1
+                if done % PROGRESS_EVERY == 0:
+                    conn.commit()
+                    log.info("Progress: %d of %d photos", done, len(rows))
+        except KeyboardInterrupt:
+            conn.commit()
+            log.warning("Stopped. %d photos were read and saved; run the same command again to continue.", stats["read"])
+            return 130
+        fixed = photo_meta.sync_search(conn)
+        conn.commit()
+    except sqlite3.Error as error:
+        log.error("Could not read the index: %s", error)
+        return 1
+    finally:
+        conn.close()
+    log.info("--- Camera details summary ---")
+    log.info("%-26s%d", "Photos read:", stats["read"])
+    log.info("%-26s%d", "With camera make/model:", stats["camera"])
+    log.info("%-26s%d", "With a GPS position:", stats["gps"])
+    log.info("%-26s%d", "Could not be read:", stats["errors"])
+    if stats["missing"]:
+        log.info("%-26s%d (run 'refresh' to update the index)", "Not on disk any more:", stats["missing"])
+    if fixed:
+        log.info("Search index: %d entries brought up to date", fixed)
+    log.info("Finished in %.1f seconds", time.monotonic() - started)
+    return 1 if stats["errors"] else 0
 
 
 # --------------------------------------------------------------------------
@@ -867,6 +1010,23 @@ def show_info(args: argparse.Namespace) -> int:
                     )
                     if by_status.get("ignored"):
                         log.info("  %d faces were ignored in the UI", by_status["ignored"])
+            if "photo_exif" in tables:
+                read, cameras, located, failed = conn.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(make IS NOT NULL OR model IS NOT NULL), 0),"
+                    " COALESCE(SUM(latitude IS NOT NULL), 0), COALESCE(SUM(error IS NOT NULL), 0) FROM photo_exif"
+                ).fetchone()
+                log.info(
+                    "Camera details: %d of %d photos read (%d with camera, %d with GPS, %d unreadable)",
+                    read, total, cameras, located, failed,
+                )
+            if "photo_annotations" in tables:
+                kinds = dict(conn.execute("SELECT kind, COUNT(*) FROM photo_annotations GROUP BY kind"))
+                if kinds:
+                    log.info("Notes and tags: %s", ", ".join(f"{count} {kind}" for kind, count in sorted(kinds.items())))
+            if "photo_embeddings" in tables:
+                for model, count in conn.execute("SELECT model, COUNT(*) FROM photo_embeddings GROUP BY model ORDER BY model"):
+                    log.info("Search vectors (%s): %d photos", model, count)
+            log.info("Search index: %s", "full-text (FTS5)" if "photo_search" in tables else "not built yet (plain text match)")
         finally:
             conn.close()
     except sqlite3.Error as error:
@@ -913,6 +1073,7 @@ def build_parser() -> argparse.ArgumentParser:
     refresh_cmd.add_argument("--force-prune", action="store_true", help="allow removing missing photos even when more than half of the library is missing")
     refresh_cmd.add_argument("--prune", action="store_true", help=argparse.SUPPRESS)  # old name, now the default behaviour
     refresh_cmd.add_argument("--rehash", action="store_true", help="re-hash every file instead of trusting size + modified time")
+    refresh_cmd.add_argument("--no-metadata", action="store_true", help="do not read camera details for photos indexed before they were recorded")
 
     faces_cmd = commands.add_parser(
         "faces", parents=[common],
@@ -965,13 +1126,20 @@ def build_parser() -> argparse.ArgumentParser:
     ui_cmd.add_argument("--port", type=int, default=8765, help="port to listen on (default 8765)")
     ui_cmd.add_argument("--no-browser", action="store_true", help="do not open the browser automatically")
 
+    metadata_cmd = commands.add_parser(
+        "metadata", parents=[common],
+        help="read camera details (make, model, lens, exposure, size, GPS) for photos in the index (phase 6)",
+    )
+    metadata_cmd.add_argument("--limit", type=int, default=None, help="only read this many photos")
+    metadata_cmd.add_argument("--reread", action="store_true", help="read every photo again, not only the ones without details")
+
     commands.add_parser("info", parents=[base], help="show where the index database is and what it contains")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    if argv and argv[0] not in {"sort", "refresh", "info", "faces", "gpucheck", "cluster", "ui", "-h", "--help"}:
+    if argv and argv[0] not in {"sort", "refresh", "info", "metadata", "faces", "gpucheck", "cluster", "ui", "-h", "--help"}:
         argv = ["sort", *argv]  # keep the original "sort_photos.py SOURCE DEST" form working
     args = build_parser().parse_args(argv)
     setup_logging(args.verbose, args.log_file)
@@ -979,6 +1147,8 @@ def main(argv: list[str] | None = None) -> int:
         return refresh(args)
     if args.command == "info":
         return show_info(args)
+    if args.command == "metadata":
+        return read_metadata(args)
     if args.command == "ui":
         try:
             import ui_server  # needs fastapi + uvicorn

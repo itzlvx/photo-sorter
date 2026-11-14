@@ -35,7 +35,7 @@ def test_library_overview(named):
     lib = named.j("/api/library")
     assert lib["total"] == 78 and sum(y["count"] for y in lib["years"]) == 78
     assert [y["year"] for y in lib["years"]] == sorted((y["year"] for y in lib["years"]), reverse=True)
-    assert set(lib["counts"]) == {"unlabeled", "review", "noface", "unscanned"}
+    assert set(lib["counts"]) == {"unlabeled", "review", "noface", "unscanned", "notes"}
     assert lib["counts"]["noface"] == 1 and lib["counts"]["unscanned"] == 1
 
 

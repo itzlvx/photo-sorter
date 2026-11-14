@@ -1,11 +1,11 @@
 # Photo sorter: roadmap and research notes
 
-Status as of 2026-11-13. Phases 1 to 4 are built (sort, faces, grouping, web UI to name people).
+Status as of 2026-11-14. Phases 1 to 6 are built (sort, faces, grouping, web UI to name people, browsing, metadata).
 
 | Phase | What | State |
 |---|---|---|
 | 5 | Browse the whole library in the UI, with quick filters for recognised people | Built |
-| 6 | A general place for photo metadata that is not about faces | Planned |
+| 6 | A general place for photo metadata that is not about faces | Built |
 | 7 | Search by typing a description ("birthday cake", "dog on a beach") | Planned, research below |
 | 8 | Optional: written captions from a local vision-language model | Planned, optional, heavy |
 
@@ -23,7 +23,24 @@ faces not yet labelled, no faces, needs review, not scanned yet, year and month,
 opens in a viewer with each face outlined and named. Photo thumbnails are made on first view and cached on this
 computer next to the index (never on the network drive).
 
-## Phase 6: metadata beyond faces
+## Phase 6: metadata beyond faces (built)
+
+Built as designed below, in `photo_meta.py`. What was decided while building it:
+
+- `photo_exif` also stores aperture, shutter speed, ISO, focal length and orientation; width/height are of the upright
+  photo. A row is written even when a file has no EXIF (or cannot be read, with `error` set), so nothing is read twice.
+  New photos are read during `sort`/`refresh` from the same file opening that finds the date. Photos indexed earlier are
+  read once by the next `refresh --apply`, or by the new `metadata` command (`--limit`, `--reread`, resumable).
+- `photo_annotations` has no fixed list of kinds in the database (the program checks it), so a new kind needs no schema
+  change. Your notes are `kind='note', source='you'`, one per photo, edited in the photo viewer.
+- `photo_embeddings` stores float32 or float16 vectors (the size tells which); `load_embeddings(model)` returns the ids
+  and a matrix ready for a numpy similarity search, which is what phase 7 needs.
+- The search index `photo_search` (FTS5) has one row per photo (file path + all annotation text) and is maintained by
+  triggers inside the database. The Photos page search matches each word against the path (substring, as before) or
+  the annotation text (FTS prefix match, accents ignored). Without FTS5 it falls back to a plain text match.
+- Annotations cascade with the photo, like faces, so a photo removed by `refresh` (file gone) loses its notes.
+
+Original design:
 
 Design goal: every later feature (search, captions, OCR, scene tags) adds *rows*, not new columns or tables, so
 the schema does not have to change each time.

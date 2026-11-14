@@ -7,7 +7,7 @@ import pytest
 import sort_photos as sp
 from conftest import ROOT
 
-COMMANDS = ["sort", "refresh", "faces", "gpucheck", "cluster", "ui", "info"]
+COMMANDS = ["sort", "refresh", "metadata", "faces", "gpucheck", "cluster", "ui", "info"]
 
 
 @pytest.mark.parametrize("command", COMMANDS)
