@@ -1,0 +1,6 @@
+# Copy this file to deploy.conf and edit it. deploy.conf is never deployed.
+# Where Photo sorter should live in production (a folder; it is created if needed).
+# Examples:  /z/apps/photo-sorter     Z:\apps\photo-sorter     //nas/apps/photo-sorter
+DEPLOY_TARGET=/path/to/production/photo-sorter
+# How many older versions to keep next to it (in <target>-backups).
+KEEP_BACKUPS=5

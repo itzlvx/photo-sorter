@@ -259,6 +259,22 @@ drive can take a little while to appear. Your original photos are only ever read
     python sort_photos.py ui                           # name people, review, merge
     # later, after adding photos: sort/refresh, faces --apply, then "Place new faces" in the UI (or cluster --apply)
 
+## Menu script, tests and deploying
+
+**On Windows, double-click or run the `.bat` files** (`photo-sorter.bat`, `run-tests.bat`, `deploy.bat`) from Command Prompt or PowerShell. They do the same as the `.sh` scripts below, which are for Git Bash, macOS and Linux. Both need Python 3.9 or newer;
+set `PHOTO_SORTER_PYTHON` (for example `py -3`) if the right one is not found automatically. Pressing Ctrl+C while the web interface runs stops it; if Windows then asks "Terminate batch job (Y/N)?", answer **Y** to leave or **N** to return to the menu.
+
+| Script | What it does |
+|---|---|
+| `photo-sorter.bat` / `./photo-sorter.sh` | Menu: **1** start the web interface, **2** intake and sort photos (asks where they are, shows a preview, then asks before changing anything), **3** find faces and group people (refresh the index, scan for faces, group them). Also `photo-sorter.bat ui`, `sort`, `faces`. Your last folders are remembered in `.photo-sorter.conf`. |
+| `run-tests.bat` / `./run-tests.sh` | Syntax checks plus all tests (`--all` adds the browser tests, `--cov` shows what is not covered, `--install` installs the test tools first, `-k word` runs matching tests only). Exit code 0 means everything passed. |
+| `deploy.bat` / `./deploy.sh` | Runs the tests, then copies the program files to the production folder, keeping dated backups. `--dry-run` shows what would happen, `--rollback` restores the previous version. It never touches the database, thumbnails, `.photo-sorter.conf` or a virtual environment in production. |
+
+**Production location.** It is still a placeholder (`/path/to/production/photo-sorter`) and `deploy.sh` refuses to run until you set it:
+`deploy.bat --target D:\where\it\goes`, or copy `deploy.conf.example` to `deploy.conf` and edit `DEPLOY_TARGET`.
+
+The test plan, with what is automated and what to check by hand, is in `docs/TEST_PLAN.md`.
+
 ## Roadmap
 - Phase 2: InsightFace detection + embeddings stored in SQLite (done)
 - Phase 3: clustering, with low-confidence faces flagged for review (done)
