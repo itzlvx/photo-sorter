@@ -258,7 +258,8 @@ The index now keeps information about each photo that is not about faces:
 - **Camera details** (make, model, lens, aperture, shutter speed, ISO, focal length, pixel size and GPS position) are
   read when `sort` or `refresh` adds a photo, from the same file read that finds its date, so it costs nothing extra.
   For photos indexed before this existed, the next `refresh --apply` reads them once (add `--no-metadata` to skip
-  that). You can also do it on its own, in steps if your library is big:
+  that). You can also do it on its own with menu option **4** (`photo-sorter.bat metadata`), or from the command
+  line, in steps if your library is big:
 
       python sort_photos.py metadata                    # preview: how many photos have no camera details yet
       python sort_photos.py metadata --apply --limit 500
@@ -297,7 +298,7 @@ set `PHOTO_SORTER_PYTHON` (for example `py -3`) if the right one is not found au
 
 | Script | What it does |
 |---|---|
-| `photo-sorter.bat` / `./photo-sorter.sh` | Menu: **1** start the web interface, **2** intake and sort photos (asks where they are, shows a preview, then asks before changing anything), **3** find faces and group people (refresh the index, scan for faces, group them). Also `photo-sorter.bat ui`, `sort`, `faces`. Your last folders are remembered in `.photo-sorter.conf`. |
+| `photo-sorter.bat` / `./photo-sorter.sh` | Menu: **1** start the web interface, **2** intake and sort photos (asks where they are, shows a preview, then asks before changing anything), **3** find faces and group people (refresh the index, scan for faces, group them), **4** read camera details (preview, then asks; can read every photo again). Also `photo-sorter.bat ui`, `sort`, `faces`, `metadata`. Your last folders are remembered in `.photo-sorter.conf`. |
 | `run-tests.bat` / `./run-tests.sh` | Syntax checks plus all tests (`--all` adds the browser tests, `--cov` shows what is not covered, `--install` installs the test tools first, `-k word` runs matching tests only). Exit code 0 means everything passed. |
 | `deploy.bat` / `./deploy.sh` | Runs the tests, then copies the program files to the production folder, keeping dated backups. `--dry-run` shows what would happen, `--rollback` restores the previous version. It never touches the database, thumbnails, `.photo-sorter.conf` or a virtual environment in production. |
 

@@ -4,6 +4,7 @@
 #   ./photo-sorter.sh ui       start the web interface straight away   (also: 1)
 #   ./photo-sorter.sh sort     intake and sort photos                  (also: 2)
 #   ./photo-sorter.sh faces    refresh, find faces, group people       (also: 3)
+#   ./photo-sorter.sh metadata read camera details for indexed photos (also: 4)
 #
 # On Windows run it from "Git Bash" (installed with Git for Windows).
 # Settings (all optional):
@@ -19,7 +20,7 @@ APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DB_ARGS=()
 if [ -n "${PHOTO_SORTER_DB:-}" ]; then DB_ARGS=(--db "$PHOTO_SORTER_DB"); fi
 
-usage() { sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 ensure_modules() {   # ensure_modules "what needs them" requirements-file module...
   local label="$1" req="$2" mod; shift 2
@@ -119,6 +120,31 @@ action_faces() {
   ok "Done. Choose 1 to open the web interface and name the people."
 }
 
+# ---------------------------------------------------------------- 4. camera details
+action_metadata() {
+  header "Read camera details"
+  say "Reads camera, lens, exposure, size and GPS position for photos already in the index. Your photos are only read, never changed."
+  say "New photos get these automatically when they are sorted or refreshed; this is for catching up or reading everything again."
+  local rc
+  local -a reread=()
+  if confirm "Read every photo again, not only the ones without details?" n; then reread=(--reread); fi
+  say "First a preview. Nothing is changed yet."
+  run_py metadata ${reread[@]+"${reread[@]}"} ${DB_ARGS[@]+"${DB_ARGS[@]}"}
+  rc=$?
+  if [ "$rc" -eq 2 ]; then fail "There is no index yet. Choose 2 to sort photos or 3 to refresh your library first."; return 1; fi
+  if [ "$rc" -ne 0 ]; then fail "The preview could not run (see above). Nothing was changed."; return 1; fi
+  confirm "Read them now?" y || { say "Nothing was changed."; return 0; }
+  run_py metadata --apply ${reread[@]+"${reread[@]}"} ${DB_ARGS[@]+"${DB_ARGS[@]}"}
+  rc=$?
+  case "$rc" in
+    0)   ok "Done. The details show in the photo viewer of the web interface." ;;
+    130) warn "Stopped. Run this option again to continue where it left off." ;;
+    1)   warn "Some photos could not be read (see above). The rest were saved." ;;
+    *)   fail "Reading camera details did not finish (exit code $rc)." ;;
+  esac
+  return "$rc"
+}
+
 # ---------------------------------------------------------------- menu
 menu() {
   local choice
@@ -127,6 +153,7 @@ menu() {
     echo " 1) Start the web interface"
     echo " 2) Intake and sort photos"
     echo " 3) Find faces and group people (refresh)"
+    echo " 4) Read camera details"
     echo " q) Quit"
     printf 'Choose: '
     IFS= read -r choice || { echo; return 0; }
@@ -134,9 +161,10 @@ menu() {
       1|ui)    action_ui;    pause ;;
       2|sort)  action_sort;  pause ;;
       3|faces) action_faces; pause ;;
+      4|metadata) action_metadata; pause ;;
       q|quit|exit) return 0 ;;
       "") ;;
-      *) warn "Please type 1, 2, 3 or q." ;;
+      *) warn "Please type 1, 2, 3, 4 or q." ;;
     esac
   done
 }
@@ -151,6 +179,7 @@ case "${1:-}" in
   1|ui)    action_ui;    exit $? ;;
   2|sort)  action_sort;  exit $? ;;
   3|faces) action_faces; exit $? ;;
+  4|metadata) action_metadata; exit $? ;;
   "")      menu ;;
   *)       fail "Unknown option: $1"; usage; exit 2 ;;
 esac

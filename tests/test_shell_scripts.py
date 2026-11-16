@@ -170,7 +170,7 @@ def test_missing_python_gives_a_helpful_message_and_exit_1(box):
 # ===================================================================== photo-sorter.sh: menu
 def test_menu_quits(box):
     r = box.run("photo-sorter.sh", stdin="q\n")
-    assert r.returncode == 0 and all(t in r.stdout for t in ("1) Start the web interface", "2) Intake and sort photos", "3) Find faces", "q) Quit"))
+    assert r.returncode == 0 and all(t in r.stdout for t in ("1) Start the web interface", "2) Intake and sort photos", "3) Find faces", "4) Read camera details", "q) Quit"))
     assert not r.calls
 
 
@@ -180,7 +180,7 @@ def test_menu_ends_cleanly_at_end_of_input(box):
 
 def test_menu_rejects_bad_choices_then_quits(box):
     r = box.run("photo-sorter.sh", stdin="9\nhello\n\nQ\n")
-    assert r.returncode == 0 and r.stderr.count("Please type 1, 2, 3 or q.") == 2 and not r.calls
+    assert r.returncode == 0 and r.stderr.count("Please type 1, 2, 3, 4 or q.") == 2 and not r.calls
 
 
 def test_unknown_argument(box):
@@ -443,6 +443,33 @@ def test_faces_cluster_failure_is_reported(box, folders):
     _, lib = folders
     r = faces_run(box, lib, FAKE_RC_cluster_apply=1)
     assert r.returncode == 1 and "Grouping did not finish" in r.stderr
+
+
+# ===================================================================== photo-sorter.sh: 4) camera details
+@pytest.mark.parametrize("word", ["metadata", "4"])
+def test_metadata_previews_then_reads(box, word, tmp_path):
+    db = tmp_path / "i.db"
+    r = box.run("photo-sorter.sh", word, stdin="\ny\n", PHOTO_SORTER_DB=db)
+    assert r.returncode == 0 and box.calls() == [f"sort_photos.py metadata --db {db}", f"sort_photos.py metadata --apply --db {db}"]
+
+
+def test_metadata_reread_decline_and_menu_return(box):
+    box.run("photo-sorter.sh", "metadata", stdin="y\n\n")
+    assert box.calls() == ["sort_photos.py metadata --reread", "sort_photos.py metadata --apply --reread"]
+    box.log.unlink()
+    r = box.run("photo-sorter.sh", "metadata", stdin="n\nn\n")
+    assert r.returncode == 0 and box.commands() == ["metadata"] and "Nothing was changed" in r.stdout + r.stderr
+    box.log.unlink()
+    r = box.run("photo-sorter.sh", stdin="4\n\n\n\nq\n")
+    assert r.returncode == 0 and box.commands() == ["metadata", "metadata"]
+
+
+def test_metadata_stop_rules(box):
+    r = box.run("photo-sorter.sh", "metadata", stdin="\ny\n", FAKE_RC_metadata=2)
+    assert r.returncode == 1 and "no index yet" in r.stderr and box.commands() == ["metadata"]
+    for rc, text in ((1, "could not be read"), (130, "Run this option again"), (3, "did not finish")):
+        r = box.run("photo-sorter.sh", "metadata", stdin="\ny\n", FAKE_RC_metadata_apply=rc)
+        assert r.returncode == rc and text in r.stderr, rc
 
 
 # ===================================================================== run-tests.sh

@@ -105,10 +105,10 @@ def test_every_script_file_parses():
 # ===================================================================== menu.py
 def test_menu_quit_eof_and_bad_choices(box):
     r = box.run("menu.py", stdin="q\n")
-    assert r.returncode == 0 and "1) Start the web interface" in r.stdout and "3) Find faces" in r.stdout
+    assert r.returncode == 0 and "1) Start the web interface" in r.stdout and "3) Find faces" in r.stdout and "4) Read camera details" in r.stdout
     assert box.run("menu.py", stdin="").returncode == 0
     r = box.run("menu.py", stdin="9\nhello\n\nQ\n")
-    assert r.stderr.count("Please type 1, 2, 3 or q.") == 2 and box.calls() == []
+    assert r.stderr.count("Please type 1, 2, 3, 4 or q.") == 2 and box.calls() == []
 
 
 def test_menu_help_and_unknown_argument(box):
@@ -239,6 +239,36 @@ def test_faces_stop_and_continue_rules(box, folders):
     assert r.returncode == 0 and box.commands() == ["refresh", "faces", "cluster"]
     r = faces(box, lib, FAKE_RC_cluster_apply=1)
     assert r.returncode == 1 and "Grouping did not finish" in r.stderr
+
+
+# ----------------------------------------------------------------- 4) camera details
+@pytest.mark.parametrize("word", ["metadata", "4"])
+def test_metadata_previews_then_reads(box, word, tmp_path):
+    r = box.run("menu.py", word, stdin=answers("", "y"), PHOTO_SORTER_DB=tmp_path / "i.db")
+    db = tmp_path / "i.db"
+    assert r.returncode == 0 and box.calls() == [f"metadata --db {db}", f"metadata --apply --db {db}"]
+    assert "Done." in r.stdout
+
+
+def test_metadata_reread_decline_and_menu_return(box):
+    box.run("menu.py", "metadata", stdin=answers("y", ""))
+    assert box.calls() == ["metadata --reread", "metadata --apply --reread"]
+    box.log.unlink()
+    r = box.run("menu.py", "metadata", stdin=answers("n", "n"))
+    assert r.returncode == 0 and box.calls() == ["metadata"] and "Nothing was changed" in r.stdout
+    box.log.unlink()
+    r = box.run("menu.py", stdin=answers("4", "", "", "", "q"))
+    assert r.returncode == 0 and box.commands() == ["metadata", "metadata"]
+
+
+def test_metadata_stop_rules(box):
+    r = box.run("menu.py", "metadata", stdin=answers("", "y"), FAKE_RC_metadata=2)
+    assert r.returncode == 1 and "no index yet" in r.stderr and box.calls() == ["metadata"]
+    box.log.unlink()
+    assert box.run("menu.py", "metadata", stdin=answers("", "y"), FAKE_RC_metadata=1).returncode == 1 and box.calls() == ["metadata"]
+    for rc, text in ((1, "could not be read"), (130, "Run this option again"), (3, "did not finish")):
+        r = box.run("menu.py", "metadata", stdin=answers("", "y"), FAKE_RC_metadata_apply=rc)
+        assert r.returncode == rc and text in r.stderr, rc
 
 
 def test_missing_packages_are_offered_for_installation(box, folders, monkeypatch):

@@ -4,6 +4,7 @@
   photo-sorter.bat ui       start the web interface straight away   (also: 1)
   photo-sorter.bat sort     intake and sort photos                  (also: 2)
   photo-sorter.bat faces    refresh, find faces, group people       (also: 3)
+  photo-sorter.bat metadata read camera details for indexed photos (also: 4)
 
 Settings (all optional): PHOTO_SORTER_PYTHON, PHOTO_SORTER_DB, PHOTO_SORTER_UI_ARGS, PHOTO_SORTER_FACES_ARGS.
 """
@@ -129,12 +130,41 @@ def action_faces():
     return 0
 
 
-ACTIONS = {"1": action_ui, "ui": action_ui, "2": action_sort, "sort": action_sort, "3": action_faces, "faces": action_faces}
+def action_metadata():
+    header("Read camera details")
+    say("Reads camera, lens, exposure, size and GPS position for photos already in the index. Your photos are only read, never changed.")
+    say("New photos get these automatically when they are sorted or refreshed; this is for catching up or reading everything again.")
+    reread = ["--reread"] if confirm("Read every photo again, not only the ones without details?", False) else []
+    say("First a preview. Nothing is changed yet.")
+    rc = run_py("metadata", *reread, *DB_ARGS)
+    if rc == 2:
+        fail("There is no index yet. Choose 2 to sort photos or 3 to refresh your library first.")
+        return 1
+    if rc != 0:
+        fail("The preview could not run (see above). Nothing was changed.")
+        return 1
+    if not confirm("Read them now?", True):
+        say("Nothing was changed.")
+        return 0
+    rc = run_py("metadata", "--apply", *reread, *DB_ARGS)
+    if rc == 0:
+        ok("Done. The details show in the photo viewer of the web interface.")
+    elif rc == 130:
+        warn("Stopped. Run this option again to continue where it left off.")
+    elif rc == 1:
+        warn("Some photos could not be read (see above). The rest were saved.")
+    else:
+        fail(f"Reading camera details did not finish (exit code {rc}).")
+    return rc
+
+
+ACTIONS = {"1": action_ui, "ui": action_ui, "2": action_sort, "sort": action_sort, "3": action_faces, "faces": action_faces,
+           "4": action_metadata, "metadata": action_metadata}
 
 
 def menu():
     while True:
-        print("\nPhoto sorter\n 1) Start the web interface\n 2) Intake and sort photos\n 3) Find faces and group people (refresh)\n q) Quit")
+        print("\nPhoto sorter\n 1) Start the web interface\n 2) Intake and sort photos\n 3) Find faces and group people (refresh)\n 4) Read camera details\n q) Quit")
         choice = ask("Choose: ")
         if choice is None:
             return 0
@@ -148,7 +178,7 @@ def menu():
         elif choice in ("q", "quit", "exit"):
             return 0
         elif choice:
-            warn("Please type 1, 2, 3 or q.")
+            warn("Please type 1, 2, 3, 4 or q.")
 
 
 def main(argv):

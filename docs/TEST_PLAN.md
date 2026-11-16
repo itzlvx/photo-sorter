@@ -1,7 +1,7 @@
 # Test plan
 
-Run everything with `./run-tests.sh --all` (about 1½ minutes). Current state: 501 automated tests. On Windows (`run-tests.bat --all`, about 6 minutes)
-the 102 bash-script tests are skipped, and 85% of the code is reached (`--cov` shows the rest).
+Run everything with `./run-tests.sh --all` (about 1½ minutes). Current state: 509 automated tests. On Windows (`run-tests.bat --all`, about 6 minutes)
+the 106 bash-script tests are skipped, and 85% of the code is reached (`--cov` shows the rest).
 
 ## How the tests are built
 
@@ -26,7 +26,7 @@ the 102 bash-script tests are skipped, and 85% of the code is reached (`--cov` s
 | Photos page (API) | `test_photo_browse.py` | listing and paging, every quick filter, year / month / text search (including a literal `%`), person filters (all / any, uncertain), thumbnails and caching, rename rules (Windows-illegal names, clashes, case-only, extension kept), delete to trash, bulk delete (partial failure, limits, duplicates), cleanup of orphaned people |
 | Metadata (phase 6) | `test_metadata.py` | tables, triggers and upgrade of an older index; camera details (make/model, lens, exposure, GPS north/south/east/west, zero GPS, rotated photos, no EXIF, bad values, unreadable files); `sort`, `refresh` (new photos, catch-up for older ones, `--no-metadata`, other libraries untouched, notes survive a move) and the `metadata` command (preview, `--limit`, `--reread`, missing and unreadable files, Ctrl+C and resume); `info`; notes (one per photo, replace, clear, too long), model annotations never overwrite yours; embeddings (32/16-bit, replace, damaged rows, mixed sizes); search (names, folders, partial names, note prefixes, punctuation, accents, edits, renames, without FTS5); the photo API (detail, saving notes, header check, search and *Has notes* filter, delete and rename) |
 | Starting the interface | `test_ui_launch.py` | no index yet, busy port, network exposure warning, Ctrl+C, browser opening, corrupt index |
-| Bash scripts | `test_shell_scripts.py` | menu (every choice, bad input, end of input), option 2 preview → confirm → apply, option 3 refresh → faces → cluster with every stop/continue branch, remembered folders, quoted paths, Python discovery, `run-tests.sh` flags, `deploy.sh` placeholder refusal, dry run, backups and pruning, stale-file removal, rollback, data/config safety |
+| Bash scripts | `test_shell_scripts.py` | menu (every choice, bad input, end of input), option 2 preview → confirm → apply, option 3 refresh → faces → cluster with every stop/continue branch, option 4 camera details preview → confirm → read (re-read, no index, errors, Ctrl+C), remembered folders, quoted paths, Python discovery, `run-tests.sh` flags, `deploy.sh` placeholder refusal, dry run, backups and pruning, stale-file removal, rollback, data/config safety |
 | Windows scripts | `test_windows_scripts.py` | the same menu, test-runner and deploy scenarios for `scripts/menu.py`, `run_tests.py`, `deploy.py` (what the `.bat` files start); `.bat` files have Windows line endings and call the right script |
 | Browser | `e2e/test_browser.py` | Photos page, naming a person then filtering by their chip, viewer keyboard navigation, rename and delete with confirmations and cancel, writing a note and finding the photo by it, multi-select delete, People / Review pages, no sideways scrolling on a phone, no JavaScript errors |
 
