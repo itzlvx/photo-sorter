@@ -1,0 +1,8 @@
+# Search by description (phase 7): python sort_photos.py clipcheck
+# ONNX Runtime is deliberately NOT listed: the face-scanning setup already installed it (requirements-faces.txt,
+# then the GPU build from README.md "Using your NVIDIA GPU"). Listing the CPU build here would install it next to
+# onnxruntime-gpu, and the two break each other. Without face scanning, also run: pip install onnxruntime
+-r requirements.txt
+numpy>=1.26
+Pillow>=10.0
+tokenizers>=0.15

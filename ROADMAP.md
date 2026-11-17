@@ -1,12 +1,13 @@
 # Photo sorter: roadmap and research notes
 
-Status as of 2026-11-14. Phases 1 to 6 are built (sort, faces, grouping, web UI to name people, browsing, metadata).
+Status as of 2026-11-16. Phases 1 to 7 are built (sort, faces, grouping, web UI to name people, browsing, metadata,
+search by description). Phase 8 is optional and not started.
 
 | Phase | What | State |
 |---|---|---|
 | 5 | Browse the whole library in the UI, with quick filters for recognised people | Built |
 | 6 | A general place for photo metadata that is not about faces | Built |
-| 7 | Search by typing a description ("birthday cake", "dog on a beach") | Planned, research below |
+| 7 | Search by typing a description ("birthday cake", "dog on a beach") | Built |
 | 8 | Optional: written captions from a local vision-language model | Planned, optional, heavy |
 
 ## Requirement as understood
@@ -20,7 +21,8 @@ plus search), listed under Phase 6.
 
 A Photos view of everything in the index, newest first, with quick filters: a person (or several, matching all or any),
 faces not yet labelled, no faces, needs review, not scanned yet, year and month, and a filename/folder search. A photo
-opens in a viewer with each face outlined and named. Photo thumbnails are made on first view and cached on this
+opens in a viewer with each face outlined and named, and can be renamed or deleted (both ask for confirmation; delete
+moves the file to a `.photo-sorter-trash` folder). Photo thumbnails are made on first view and cached on this
 computer next to the index (never on the network drive).
 
 ## Phase 6: metadata beyond faces (built)
@@ -53,6 +55,85 @@ the schema does not have to change each time.
 - Everything is keyed by photo id and cascades when a photo is removed, like faces today.
 
 ## Phase 7: search by description (the main research question)
+
+### Step 1 built: `clipcheck` (2026-11-16)
+
+In `clip_search.py`, with the shared GPU helpers moved from `face_scan.py` to `onnx_setup.py`. What was decided:
+
+- **Model format:** the Immich ONNX exports, unchanged (`config.json`, `visual/model.onnx` + `preprocess_cfg.json`,
+  `textual/model.onnx` + `tokenizer.json` + `tokenizer_config.json`). Input names, batch size and the token type
+  (int32/int64) are read from the model, not assumed. Preprocessing follows `preprocess_cfg.json` (`shortest` = crop,
+  `squash`, `longest` = pad). JPEGs are decoded at reduced size (Pillow draft mode), which makes a 12-megapixel photo
+  cheap to prepare. SigLIP-family tokenizers get lower-case text without punctuation, like OpenCLIP does.
+- **Packages:** only `tokenizers` is new (`requirements-search.txt`). ONNX Runtime is deliberately not listed there, so
+  pip never installs the CPU build next to `onnxruntime-gpu`.
+- **Models live** in `%LOCALAPPDATA%\photo-sorter\models\<name>`. Download only with `--download`: small files first
+  (a wrong name fails fast), each file via `.part` and renamed when complete, free disk space checked, the request
+  carries only a generic User-Agent.
+- **Suggested models** (`--list`): `ViT-L-14-quickgelu__dfn2b` (default, about 1.7 GB), `ViT-B-16-SigLIP2__webli`
+  (about 1.5 GB), `ViT-B-32__openai` (about 0.6 GB). Any immich-app CLIP/SigLIP name works; XLM-Roberta/NLLB models need
+  a second text input and are refused with a clear message for now.
+- **The check** uses generated pictures only: red/green/blue must match their words, then timings (photo decoding,
+  pictures on GPU and CPU, one search) and an estimate for the photos in your index.
+- Tested with a tiny generated ONNX model (`tests/test_clip_search.py`).
+
+Real runs on the RTX 2060 Max-Q (6 GB), with generated pictures only:
+
+| Model | Download | Picture on GPU | Picture on CPU | One search | Colour check |
+|---|---|---|---|---|---|
+| `ViT-L-14-quickgelu__dfn2b` | 1.7 GB | 66 ms | 1,020 ms | 9 ms | 3 of 3 (correct about 0.28, next best about 0.15) |
+| `ViT-B-16-SigLIP2__webli` | 1.5 GB | 21 ms | 221 ms | 11 ms | 3 of 3 (correct about 0.15, next best about 0.09) |
+
+Both exports accept one picture per call (fixed batch size 1). Opening a 12-megapixel JPEG at reduced size took about
+40 ms of CPU time, which `embed` does in background threads.
+
+### Step 2 built: `embed` (2026-11-16)
+
+In `clip_search.py`. One vector per photo per model in `photo_embeddings`, as 16-bit unit vectors (768 numbers, about
+1.5 KB per photo for both suggested models). Decisions:
+
+- **Same shape as `faces`:** a preview unless `--apply`, `--limit`, resumable (photos without a vector for this model
+  are the work list), `--again` to replace, Ctrl+C keeps every finished batch. Each batch is written in one transaction.
+- **The model is never downloaded here**; `embed` points to `clipcheck --model NAME --download`, so a download always
+  goes through the check first.
+- **Photos are read and shrunk in background threads** (`--workers`, default 4) while the GPU encodes.
+- **Missing files** are skipped with the same "is the drive connected?" advice as `faces`. **Unreadable files** are
+  skipped and tried again on the next run (nothing is recorded, so no schema change; the run ends with exit code 1 so
+  the problem stays visible). The model failing on 3 batches in a row stops the run.
+- **Safety checks:** the model is loaded and tried on a test picture before any photo is read, and if this model's
+  vectors already in the index have a different size (changed model files), the run stops and asks for `--again`
+  instead of mixing them.
+- Vectors for other models are listed and never touched, so two models can be compared side by side.
+
+Checked on a throw-away library of 320 generated pictures (20 of them 12-megapixel): DFN-2B 14 photos/s, SigLIP 2
+39 photos/s on the GPU, resumed correctly after `--limit`, and the stored vectors equal the model's output for the
+same file (cosine 1.000). Not yet run on your real library.
+
+### Step 3 built: the search box (2026-11-16)
+
+A **Describe a photo** box on the Photos page (`/api/photos?d=...`, plus `/api/search/models`). Decisions:
+
+- **The text half runs on the CPU in the web interface.** Measured on this laptop: about 0.1 s per search for both
+  suggested models (the first search loads the model: about 2 s for DFN-2B, 6 s for SigLIP 2). This keeps the GPU's
+  6 GB free for face scanning and `embed`, and means the web interface never needs CUDA.
+- **Only the text half is loaded** (`ClipModel(..., image=False)`), and each model's vectors are kept in memory as 16-bit
+  numbers (about 150 MB per 100,000 photos at 768 numbers), compared 20,000 rows at a time. They are read again only when
+  they change in the index (count, newest row id or photo ids differ), so `embed`, deleted photos and `--again` are picked
+  up without restarting. The last 8 searches are remembered, so "Show more" does not encode the text again.
+- **Ranking first, then filters.** Every photo with a vector is scored; the other filters (people, year/month, quick
+  filters, the name/folder/note box) then decide which of them are shown, best first.
+- **No fixed threshold.** Scores differ per model, so the person chooses how many to see (best 50 to 1000, default 200).
+  The match score shows when hovering over a photo.
+- **Several models:** the default is the one with the most stored vectors; a menu switches between them.
+- **Clear messages instead of errors** for: no vectors yet (points to option 5), model files gone (points to
+  `clipcheck --download`), missing packages, changed model (points to `embed --again`).
+
+Checked with the real models on 7 drawn scenes (grass under a sky, a stop sign, a checkerboard, a sunset, the moon, a
+birthday cake, a "HAPPY BIRTHDAY" card): both models put the right one first for all 7 descriptions. That shows the
+whole path works; it says nothing yet about quality on real family photos.
+
+Still open: try both models on a few hundred of your own photos and keep the better one; multilingual models (XLM-Roberta,
+NLLB) need a second text input and are refused for now.
 
 ### How it works
 
@@ -129,9 +210,9 @@ produce tags by comparing each photo with a list of words, which avoids another 
 ## Suggested order
 
 1. Phase 5 (done): immediately useful, and the filters are reused by search.
-2. Phase 6: small, and unblocks everything else.
-3. Phase 7 with ONNX CLIP-family model: biggest payoff. Start with `clipcheck`, then pick between the DFN-2B-class
-   and SigLIP 2 models by trying both on a few hundred of your photos.
+2. Phase 6 (done): small, and unblocks everything else.
+3. Phase 7 (done) with ONNX CLIP-family models: biggest payoff. What is left is choosing between DFN-2B and SigLIP 2
+   by trying both on a few hundred of your photos (both can be stored side by side).
 4. Phase 8 only if wanted.
 
 ## Sources

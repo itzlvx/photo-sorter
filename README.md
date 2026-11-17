@@ -283,6 +283,75 @@ tags, captions and text found in photos (`photo_annotations`). Anything a progra
 program's name, and re-running it replaces only its own rows, so your notes are never overwritten. Searching uses
 SQLite's built-in full-text index; if your Python's SQLite lacks it, search still works, just more slowly.
 
+### Phase 7: searching by description
+
+Find photos by typing what is in them ("birthday cake", "dog on a beach", "snow on the car"). It uses a CLIP-family
+model that runs offline on this computer, through the same ONNX Runtime as face scanning. Three steps:
+
+1. **Check a model** (`clipcheck`, menu option **6**): download one and confirm it works on your GPU.
+2. **Store search vectors** (`embed`, menu option **5**): read every photo once. Run it again after adding photos.
+3. **Search** on the Photos page of the web interface: type into **Describe a photo**.
+
+#### Check a model
+
+`clipcheck` lets you try models on your computer before choosing one:
+
+    pip install -r requirements-search.txt                 # adds 'tokenizers'; uses the ONNX Runtime you already have
+    python sort_photos.py clipcheck --list                 # suggested models, and which are downloaded
+    python sort_photos.py clipcheck --download             # download the default model (about 1.7 GB), then check it
+    python sort_photos.py clipcheck --model ViT-B-32__openai --download   # a smaller, faster one to compare
+
+Models come from the Immich project's ONNX exports on Hugging Face (`huggingface.co/immich-app/<model>`) and are kept
+in a `models` folder next to the index (`%LOCALAPPDATA%\photo-sorter\models`), never on the network drive. Nothing is
+downloaded without `--download`; an interrupted download continues where it stopped when you run the command again.
+
+`clipcheck` then:
+
+- loads the model and says whether it runs on the NVIDIA GPU or the CPU;
+- checks that pictures and words line up (plain red, green and blue pictures must match "red", "green" and "blue");
+- times opening a 12-megapixel JPEG, encoding pictures on the GPU (and on the CPU for comparison) and turning a search
+  into a vector (the wait each time you search);
+- estimates how long indexing your library would take (from the number of photos in your index) and the space the
+  vectors need.
+
+It uses generated test pictures only, never your photos. Options: `--gpu` / `--cpu`, `--runs`, `--batch`,
+`--no-cpu-compare`, `--model-root`. Multilingual XLM-Roberta and NLLB models are not supported yet. In the menu this is option **6**: it shows the list, asks which model to check, and asks before downloading (`clipcheck` exits with code 3 when the model is not downloaded).
+
+On an RTX 2060 (6 GB), the default `ViT-L-14-quickgelu__dfn2b` took about 66 ms per photo and `ViT-B-16-SigLIP2__webli`
+about 21 ms; turning a search into a vector took about 10 ms with either.
+
+#### Store search vectors for your photos
+
+`embed` runs every indexed photo once through the picture half of a downloaded model and stores the result in the
+index (768 numbers per photo for both suggested models, as 16-bit numbers: about 1.5 KB per photo). Like `faces`, it
+is a preview until you add `--apply`, saves after every batch, and continues where it stopped:
+
+    python sort_photos.py embed                                  # preview: how many photos would be processed
+    python sort_photos.py embed --apply --limit 50               # try it on 50 photos first
+    python sort_photos.py embed --apply                          # every photo without a vector for this model
+    python sort_photos.py embed --apply --model ViT-B-16-SigLIP2__webli   # a second model, stored side by side
+
+The model must be downloaded first (`clipcheck --model NAME --download`). Each vector is stored with its model's name,
+so several models can be compared on the same photos. Photos that are missing or cannot be read are skipped and tried
+again next time. Options: `--again` (replace this model's vectors), `--gpu` / `--cpu`, `--batch`, `--workers`,
+`--model-root`. New photos added by `sort`/`refresh` get their vector the next time you run `embed --apply`. In the menu this is option **5**, which also offers to download the model when it is missing (`embed` exits with code 3 in that case).
+
+#### Search in the web interface
+
+On the **Photos** page, type into **Describe a photo** and press Enter. Photos come back best match first (hover over one
+to see its match score). Everything else on the page still applies, so "birthday cake" + Alice + 2019 works, and so does
+combining it with the name/folder/note box. While a description is active:
+
+- **Best 50 / 100 / 200 / 500 / 1000** sets how far down the list to go. There is no fixed "match" cut-off, because each
+  model scores on its own scale (the default model's good matches sit around 0.25 to 0.33, SigLIP 2's around 0.10 to 0.18).
+- If more than one model has vectors stored, a menu lets you choose which one to search with, so you can compare them.
+- A note says how many of the photos on screen have no search vector yet (run option 5 to add them).
+- **Clear filters** goes back to the normal newest-first view.
+
+The box is greyed out until some photos have search vectors. The first search after starting the interface loads the
+text half of the model (a few seconds); after that a search takes about 0.1 s. Searching runs on the CPU, so the GPU
+stays free for face scanning and `embed`.
+
 ### The whole workflow
 
     python sort_photos.py sort SOURCE DEST --apply     # or: refresh DEST --apply for a library that is already sorted
@@ -298,7 +367,7 @@ set `PHOTO_SORTER_PYTHON` (for example `py -3`) if the right one is not found au
 
 | Script | What it does |
 |---|---|
-| `photo-sorter.bat` / `./photo-sorter.sh` | Menu: **1** start the web interface, **2** intake and sort photos (asks where they are, shows a preview, then asks before changing anything), **3** find faces and group people (refresh the index, scan for faces, group them), **4** read camera details (preview, then asks; can read every photo again). Also `photo-sorter.bat ui`, `sort`, `faces`, `metadata`. Your last folders are remembered in `.photo-sorter.conf`. |
+| `photo-sorter.bat` / `./photo-sorter.sh` | Menu: **1** start the web interface, **2** intake and sort photos (asks where they are, shows a preview, then asks before changing anything), **3** find faces and group people (refresh the index, scan for faces, group them), **4** read camera details (preview, then asks; can read every photo again), **5** prepare search (asks which model, shows a preview, offers to download the model if it is missing, then stores the search vectors), **6** check a search model (shows the suggested models, checks and times the one you pick, downloads it only after asking; a model that passes becomes the default for 5). Also `photo-sorter.bat ui`, `sort`, `faces`, `metadata`, `search`, `clipcheck`. Your last folders and search model are remembered in `.photo-sorter.conf`. |
 | `run-tests.bat` / `./run-tests.sh` | Syntax checks plus all tests (`--all` adds the browser tests, `--cov` shows what is not covered, `--install` installs the test tools first, `-k word` runs matching tests only). Exit code 0 means everything passed. |
 | `deploy.bat` / `./deploy.sh` | Runs the tests, then copies the program files to the production folder, keeping dated backups. `--dry-run` shows what would happen, `--rollback` restores the previous version. It never touches the database, thumbnails, `.photo-sorter.conf` or a virtual environment in production. |
 
@@ -312,6 +381,7 @@ The test plan, with what is automated and what to check by hand, is in `docs/TES
 - Phase 3: clustering, with low-confidence faces flagged for review (done)
 - Phase 4: web interface to name people and work the review queue (done)
 - Phase 5: browse the whole library with people quick filters, rename and delete with confirmation (done)
-- Phases 6-8 (planned): a wider metadata store, search by typing a description, optional AI captions. The research and
-  design are in [docs/ROADMAP.md](docs/ROADMAP.md).
+- Phase 6: camera details, notes and a search index (done)
+- Phase 7: search by typing a description (done)
+- Phase 8 (planned): optional AI captions. The research and design are in [ROADMAP.md](ROADMAP.md).
 - Ideas not built yet: writing people's names into photo metadata or folders, an undo button

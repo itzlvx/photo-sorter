@@ -35,6 +35,17 @@ Check that the NVIDIA GPU is really being used, and how much faster it is:
 
     python sort_photos.py gpucheck
 
+Check and time a model for searching photos by description (phase 7; needs requirements-search.txt):
+
+    python sort_photos.py clipcheck --list       # suggested models
+    python sort_photos.py clipcheck --download   # download the default model, then check it
+
+Store a search vector for every photo with that model (phase 7):
+
+    python sort_photos.py embed                      # preview: how many photos would be processed
+    python sort_photos.py embed --apply --limit 50   # try it on 50 photos first
+    python sort_photos.py embed --apply              # every photo without a vector yet (resumable)
+
 Logging: key steps are always printed. Add -v for detailed (debug) output and
 --log-file FILE to also save a full debug log to a file.
 
@@ -1102,6 +1113,35 @@ def build_parser() -> argparse.ArgumentParser:
     gpucheck_cmd.add_argument("--det-size", type=int, default=640, help="detector input size used for the test (default 640)")
     gpucheck_cmd.add_argument("--runs", type=int, default=5, help="timed runs per device (default 5)")
 
+    clipcheck_cmd = commands.add_parser(
+        "clipcheck", parents=[base],
+        help="download (if asked), check and time a model for searching photos by description (phase 7)",
+    )
+    clipcheck_cmd.add_argument("--model", default="ViT-L-14-quickgelu__dfn2b", help="model name from huggingface.co/immich-app (default ViT-L-14-quickgelu__dfn2b; --list shows suggestions)")
+    clipcheck_cmd.add_argument("--model-root", type=Path, default=None, help="where search models are kept (default: a 'models' folder next to the index)")
+    clipcheck_cmd.add_argument("--list", action="store_true", help="show the suggested models and which are downloaded, then stop")
+    clipcheck_cmd.add_argument("--download", action="store_true", help="download the model from Hugging Face if it is not here yet")
+    clip_hardware = clipcheck_cmd.add_mutually_exclusive_group()
+    clip_hardware.add_argument("--gpu", action="store_true", help="require the NVIDIA GPU (CUDA)")
+    clip_hardware.add_argument("--cpu", action="store_true", help="ignore any GPU and use the CPU")
+    clipcheck_cmd.add_argument("--runs", type=int, default=5, help="timed runs per test (default 5)")
+    clipcheck_cmd.add_argument("--batch", type=int, default=16, help="pictures per batch in the timing test (default 16)")
+    clipcheck_cmd.add_argument("--no-cpu-compare", action="store_true", help="skip timing the CPU for comparison")
+
+    embed_cmd = commands.add_parser(
+        "embed", parents=[common],
+        help="store a search vector for every indexed photo with a downloaded search model (phase 7)",
+    )
+    embed_cmd.add_argument("--model", default="ViT-L-14-quickgelu__dfn2b", help="search model to use (default ViT-L-14-quickgelu__dfn2b; download it first with clipcheck --download)")
+    embed_cmd.add_argument("--model-root", type=Path, default=None, help="where search models are kept (default: a 'models' folder next to the index)")
+    embed_cmd.add_argument("--limit", type=int, default=None, help="only process this many photos (good for a first test)")
+    embed_cmd.add_argument("--again", action="store_true", help="process every photo again, replacing this model's stored vectors")
+    embed_hardware = embed_cmd.add_mutually_exclusive_group()
+    embed_hardware.add_argument("--gpu", action="store_true", help="require the NVIDIA GPU (CUDA): stop with an explanation instead of quietly using the CPU")
+    embed_hardware.add_argument("--cpu", action="store_true", help="ignore any GPU and use the CPU")
+    embed_cmd.add_argument("--batch", type=int, default=16, help="pictures per batch, for models that accept several at once (default 16)")
+    embed_cmd.add_argument("--workers", type=int, default=4, help="background threads that read and shrink photos (default 4)")
+
     cluster_cmd = commands.add_parser(
         "cluster", parents=[common],
         help="group similar faces into people and flag the uncertain ones (phase 3)",
@@ -1139,7 +1179,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    if argv and argv[0] not in {"sort", "refresh", "info", "metadata", "faces", "gpucheck", "cluster", "ui", "-h", "--help"}:
+    if argv and argv[0] not in {"sort", "refresh", "info", "metadata", "faces", "gpucheck", "clipcheck", "embed", "cluster", "ui", "-h", "--help"}:
         argv = ["sort", *argv]  # keep the original "sort_photos.py SOURCE DEST" form working
     args = build_parser().parse_args(argv)
     setup_logging(args.verbose, args.log_file)
@@ -1156,6 +1196,13 @@ def main(argv: list[str] | None = None) -> int:
             log.error("The web interface needs extra packages (%s). Install them with: pip install -r requirements-ui.txt", error)
             return 2
         return ui_server.run_ui(args)
+    if args.command in ("clipcheck", "embed"):
+        try:
+            import clip_search  # needs numpy + Pillow; ONNX Runtime and tokenizers are checked inside
+        except ImportError as error:
+            log.error("Search needs extra packages (%s). Install them with: pip install -r requirements-search.txt", error)
+            return 2
+        return clip_search.clip_check(args) if args.command == "clipcheck" else clip_search.embed_photos(args)
     if args.command == "cluster":
         try:
             import face_cluster  # needs numpy only

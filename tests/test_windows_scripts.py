@@ -21,7 +21,7 @@ RECORDER = textwrap.dedent('''\
     with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as f:
         f.write(" ".join(sys.argv[1:]) + "\\n")
     cmd = sys.argv[1].replace("-", "_") if len(sys.argv) > 1 else ""
-    var = "FAKE_RC_" + cmd + ("_apply" if "--apply" in sys.argv else "")
+    var = "FAKE_RC_" + cmd + ("_apply" if "--apply" in sys.argv else "_download" if "--download" in sys.argv else "")
     sys.exit(int(os.environ.get(var, "0")))
 ''')
 
@@ -105,10 +105,10 @@ def test_every_script_file_parses():
 # ===================================================================== menu.py
 def test_menu_quit_eof_and_bad_choices(box):
     r = box.run("menu.py", stdin="q\n")
-    assert r.returncode == 0 and "1) Start the web interface" in r.stdout and "3) Find faces" in r.stdout and "4) Read camera details" in r.stdout
+    assert r.returncode == 0 and "1) Start the web interface" in r.stdout and "3) Find faces" in r.stdout and "4) Read camera details" in r.stdout and "5) Prepare search" in r.stdout and "6) Check a search model" in r.stdout
     assert box.run("menu.py", stdin="").returncode == 0
     r = box.run("menu.py", stdin="9\nhello\n\nQ\n")
-    assert r.stderr.count("Please type 1, 2, 3, 4 or q.") == 2 and box.calls() == []
+    assert r.stderr.count("Please type 1, 2, 3, 4, 5, 6 or q.") == 2 and box.calls() == []
 
 
 def test_menu_help_and_unknown_argument(box):
@@ -269,6 +269,93 @@ def test_metadata_stop_rules(box):
     for rc, text in ((1, "could not be read"), (130, "Run this option again"), (3, "did not finish")):
         r = box.run("menu.py", "metadata", stdin=answers("", "y"), FAKE_RC_metadata_apply=rc)
         assert r.returncode == rc and text in r.stderr, rc
+
+
+# ----------------------------------------------------------------- 5) prepare search
+DFN = "ViT-L-14-quickgelu__dfn2b"
+SIGLIP = "ViT-B-16-SigLIP2__webli"
+
+
+@pytest.mark.parametrize("word", ["search", "5"])
+def test_search_previews_then_processes(box, word, tmp_path):
+    db = tmp_path / "i.db"
+    r = box.run("menu.py", word, stdin=answers("", "y"), PHOTO_SORTER_DB=db)
+    assert r.returncode == 0 and box.calls() == [f"embed --model {DFN} --db {db}", f"embed --apply --model {DFN} --db {db}"]
+    assert "Done." in r.stdout
+
+
+def test_search_model_choice_is_remembered_decline_and_menu_return(box):
+    box.run("menu.py", "search", stdin=answers(f' "{SIGLIP}" ', "y"))
+    assert box.calls() == [f"embed --model {SIGLIP}", f"embed --apply --model {SIGLIP}"]
+    box.log.unlink()
+    r = box.run("menu.py", "search", stdin=answers("", "n"))
+    assert r.returncode == 0 and box.calls() == [f"embed --model {SIGLIP}"] and "Nothing was changed" in r.stdout
+    assert SIGLIP in r.stdout  # offered as the default
+    box.log.unlink()
+    r = box.run("menu.py", stdin=answers("5", "", "", "", "q"))
+    assert r.returncode == 0 and box.commands() == ["embed", "embed"]
+
+
+def test_search_offers_to_download_a_missing_model(box):
+    r = box.run("menu.py", "search", stdin=answers("", "y", "y"), FAKE_RC_embed=3)
+    assert r.returncode == 0 and box.calls() == [
+        f"embed --model {DFN}", f"clipcheck --model {DFN} --download --no-cpu-compare", f"embed --apply --model {DFN}"]
+    box.log.unlink()
+    r = box.run("menu.py", "search", stdin=answers("", "n"), FAKE_RC_embed=3)
+    assert r.returncode == 0 and box.commands() == ["embed"] and "Nothing was changed" in r.stdout
+    box.log.unlink()
+    r = box.run("menu.py", "search", stdin=answers("", "y", "y"), FAKE_RC_embed=3, FAKE_RC_clipcheck_download=1)
+    assert r.returncode == 1 and box.commands() == ["embed", "clipcheck"] and "could not be downloaded" in r.stderr
+    box.log.unlink()
+    r = box.run("menu.py", "search", stdin=answers("", "y", "y"), FAKE_RC_embed=3, FAKE_RC_clipcheck_download=130)
+    assert r.returncode == 130 and box.commands() == ["embed", "clipcheck"] and "fetch the rest" in r.stderr
+
+
+def test_search_stop_rules(box):
+    r = box.run("menu.py", "search", stdin=answers("", "y"), FAKE_RC_embed=2)
+    assert r.returncode == 1 and "is there an index yet" in r.stderr and box.calls() == [f"embed --model {DFN}"]
+    box.log.unlink()
+    assert box.run("menu.py", "search", stdin=answers("", "y"), FAKE_RC_embed=1).returncode == 1 and box.commands() == ["embed"]
+    for rc, text in ((1, "tried again next time"), (130, "Run this option again"), (4, "did not finish")):
+        r = box.run("menu.py", "search", stdin=answers("", "y"), FAKE_RC_embed_apply=rc)
+        assert r.returncode == rc and text in r.stderr, rc
+
+
+# ----------------------------------------------------------------- 6) check a search model
+@pytest.mark.parametrize("word", ["clipcheck", "6"])
+def test_clipcheck_lists_checks_and_remembers_the_model(box, word, tmp_path):
+    db = tmp_path / "i.db"
+    r = box.run("menu.py", word, stdin=answers(""), PHOTO_SORTER_DB=db)
+    assert r.returncode == 0 and box.calls() == ["clipcheck --list", f"clipcheck --model {DFN} --db {db}"]
+    assert "The model works" in r.stdout and f"SEARCH_MODEL={DFN}" in box.conf.read_text(encoding="utf-8")
+
+
+def test_clipcheck_choice_becomes_the_default_for_option_5(box):
+    assert box.run("menu.py", "clipcheck", stdin=answers(SIGLIP)).returncode == 0
+    box.log.unlink()
+    box.run("menu.py", "search", stdin=answers("", "n"))
+    assert box.calls() == [f"embed --model {SIGLIP}"]
+    box.log.unlink()
+    r = box.run("menu.py", stdin=answers("6", "", "", "q"))
+    assert r.returncode == 0 and box.calls() == ["clipcheck --list", f"clipcheck --model {SIGLIP}"]
+
+
+def test_clipcheck_downloads_only_after_asking(box):
+    r = box.run("menu.py", "clipcheck", stdin=answers("", "y"), FAKE_RC_clipcheck=3)
+    assert r.returncode == 0 and box.calls() == ["clipcheck --list", f"clipcheck --model {DFN}", f"clipcheck --model {DFN} --download"]
+    box.log.unlink()
+    r = box.run("menu.py", "clipcheck", stdin=answers("", "n"), FAKE_RC_clipcheck=3)
+    assert r.returncode == 0 and "Nothing was downloaded" in r.stdout and not any("--download" in c for c in box.calls())
+    for rc, text in ((1, "did not pass the check"), (130, "continues where it stopped"), (2, "could not run")):
+        r = box.run("menu.py", "clipcheck", stdin=answers("", "y"), FAKE_RC_clipcheck=3, FAKE_RC_clipcheck_download=rc)
+        assert r.returncode == rc and text in r.stderr, rc
+
+
+def test_clipcheck_failures_are_not_remembered(box):
+    for rc, text in ((1, "did not pass the check"), (2, "is the model name right")):
+        r = box.run("menu.py", "clipcheck", stdin=answers("bad"), FAKE_RC_clipcheck=rc)
+        assert r.returncode == rc and text in r.stderr, rc
+        assert not box.conf.exists() or "SEARCH_MODEL" not in box.conf.read_text(encoding="utf-8")
 
 
 def test_missing_packages_are_offered_for_installation(box, folders, monkeypatch):

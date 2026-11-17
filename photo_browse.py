@@ -7,6 +7,7 @@ Adds these routes to the web interface (see ui_server.py):
   GET /api/photos/{id}/image      larger picture for the viewer
   GET /api/library                years and months with counts, and the counts for the quick filters
   GET /api/people/chips           named people with how many photos they are in (the quick links)
+  GET /api/search/models          models with search vectors (phase 7); /api/photos?d=... searches by description
   POST /api/photos/{id}/note      save your note on a photo (phase 6; searchable from the Photos page)
   POST /api/photos/{id}/rename    give the file a new name (same folder, same extension)
   POST /api/photos/delete         delete several photos at once (same as below, one by one)
@@ -27,12 +28,15 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse, Response
+import numpy as np
 from PIL import Image, ImageOps
 from pydantic import BaseModel
 
 import photo_meta
 import sort_photos as sp  # also registers HEIC support
 
+SEARCH_UNAVAILABLE = ("Searching by description needs numpy, Pillow and tokenizers. Install them with: "
+                      "pip install -r requirements-search.txt, then restart the web interface.")
 BAD_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 MAX_NAME = 150
@@ -127,7 +131,8 @@ def render_jpeg(path: Path, side: int, quality: int) -> bytes:
         return out.getvalue()
 
 
-def add_photo_routes(app: FastAPI, get_db, thumb_dir: Path) -> None:
+def add_photo_routes(app: FastAPI, get_db, thumb_dir: Path, search=None) -> None:
+    """search: a clip_search.PhotoSearch for searching by description (phase 7), or None when it cannot be loaded."""
     def photo_row(db: sqlite3.Connection, photo_id: int) -> sqlite3.Row:
         row = db.execute("SELECT id, sha256, sorted_path, taken_at, date_source, size_bytes FROM photos WHERE id = ?", (photo_id,)).fetchone()
         if row is None:
@@ -295,9 +300,48 @@ def add_photo_routes(app: FastAPI, get_db, thumb_dir: Path) -> None:
         return {"deleted": deleted, "failed": failed}
 
     # ---------------------------------------------------------------------- list
+    @app.get("/api/search/models")
+    def search_models(db: sqlite3.Connection = Depends(get_db)):
+        """Models with search vectors in the index (phase 7), the one used by default, and the result limits."""
+        if search is None:
+            return {"models": [], "default": "", "limits": [], "unavailable": SEARCH_UNAVAILABLE}
+        models = search.stored_models(db)
+        ready = [m for m in models if m["ready"]]
+        return {"models": models, "default": (ready or models or [{"name": ""}])[0]["name"],
+                "limits": list(search_limits()), "unavailable": ""}
+
+    def search_limits():
+        from clip_search import SEARCH_LIMITS
+        return SEARCH_LIMITS
+
+    def ranked_photos(db: sqlite3.Connection, text: str, model: str, top: int, clause: str, params: list):
+        """Photos matching the filters, best match first: ([(id, score)], model, photos without a vector, limit used)."""
+        from clip_search import SearchError
+        if search is None:
+            raise HTTPException(409, SEARCH_UNAVAILABLE)
+        models = search.stored_models(db)
+        if not models:
+            raise HTTPException(409, "No photos have search vectors yet. Choose option 5 in the menu (or run "
+                                     "python sort_photos.py embed --apply), then search again.")
+        names = [m["name"] for m in models]
+        name = model or next((m["name"] for m in models if m["ready"]), names[0])
+        if name not in names:
+            raise HTTPException(400, f"There are no search vectors for the model {name}.")
+        try:
+            ids, scores = search.rank(db, name, text)
+        except SearchError as error:
+            raise HTTPException(409, str(error))
+        allowed = np.fromiter((r[0] for r in db.execute(f"SELECT ph.id FROM photos ph{clause}", params)), dtype=np.int64)
+        keep = np.isin(ids, allowed)
+        limits = search_limits()
+        top = min(limits, key=lambda n: abs(n - top))
+        pairs = [(int(i), float(s)) for i, s in zip(ids[keep][:top], scores[keep][:top])]
+        return pairs, name, int(len(allowed) - int(keep.sum())), top
+
     @app.get("/api/photos")
     def list_photos(person: str = "", match: str = "all", uncertain: bool = False, filter: str = "",
                     year: str = "", month: str = "", q: str = "", order: str = "new",
+                    d: str = "", model: str = "", top: int = 200,
                     limit: int = 96, offset: int = 0, db: sqlite3.Connection = Depends(get_db)):
         where: list[str] = []
         params: list = []
@@ -331,13 +375,26 @@ def add_photo_routes(app: FastAPI, get_db, thumb_dir: Path) -> None:
             where.append(condition)
             params += values
         clause = (" WHERE " + " AND ".join(where)) if where else ""
-        direction = "ASC" if order == "old" else "DESC"
-        total = db.execute(f"SELECT COUNT(*) FROM photos ph{clause}", params).fetchone()[0]
-        rows = db.execute(
-            f"SELECT ph.id, ph.sorted_path, ph.taken_at FROM photos ph{clause}"
-            f" ORDER BY ph.taken_at {direction}, ph.id {direction} LIMIT ? OFFSET ?",
-            [*params, max(1, min(limit, 300)), max(0, offset)],
-        ).fetchall()
+        limit, offset = max(1, min(limit, 300)), max(0, offset)
+        described = None
+        scores: dict[int, float] = {}
+        if d.strip():   # phase 7: best match for the description first, among the photos the other filters allow
+            pairs, used, without, top = ranked_photos(db, d, model, top, clause, params)
+            total = len(pairs)
+            page = pairs[offset:offset + limit]
+            scores = dict(page)
+            found = {r["id"]: r for r in db.execute(
+                f"SELECT id, sorted_path, taken_at FROM photos WHERE id IN ({marks(len(page))})", [i for i, _ in page])} if page else {}
+            rows = [found[i] for i, _ in page if i in found]
+            described = {"model": used, "without_vectors": without, "top": top}
+        else:
+            direction = "ASC" if order == "old" else "DESC"
+            total = db.execute(f"SELECT COUNT(*) FROM photos ph{clause}", params).fetchone()[0]
+            rows = db.execute(
+                f"SELECT ph.id, ph.sorted_path, ph.taken_at FROM photos ph{clause}"
+                f" ORDER BY ph.taken_at {direction}, ph.id {direction} LIMIT ? OFFSET ?",
+                [*params, limit, offset],
+            ).fetchall()
 
         info: dict[int, dict] = {r["id"]: {"people": {}, "faces": 0, "unlabeled": 0} for r in rows}
         ids = list(info)
@@ -357,15 +414,19 @@ def add_photo_routes(app: FastAPI, get_db, thumb_dir: Path) -> None:
                     entry["people"][f["person_id"]] = f["name"]
                 else:
                     entry["unlabeled"] += 1
-        return {
+        result = {
             "total": total,
             "photos": [
                 {"id": r["id"], "name": file_name(r["sorted_path"]), "taken": (r["taken_at"] or "")[:10],
                  "faces": info[r["id"]]["faces"], "unlabeled": info[r["id"]]["unlabeled"],
-                 "people": [{"id": pid, "name": name} for pid, name in info[r["id"]]["people"].items()]}
+                 "people": [{"id": pid, "name": name} for pid, name in info[r["id"]]["people"].items()],
+                 **({"score": round(scores[r["id"]], 4)} if r["id"] in scores else {})}
                 for r in rows
             ],
         }
+        if described:
+            result["search"] = described
+        return result
 
     # ------------------------------------------------------------ library & chips
     @app.get("/api/library")

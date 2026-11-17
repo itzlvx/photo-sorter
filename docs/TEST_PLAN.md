@@ -1,7 +1,7 @@
 # Test plan
 
-Run everything with `./run-tests.sh --all` (about 1½ minutes). Current state: 509 automated tests. On Windows (`run-tests.bat --all`, about 6 minutes)
-the 106 bash-script tests are skipped, and 85% of the code is reached (`--cov` shows the rest).
+Run everything with `./run-tests.sh --all` (about 1½ minutes). Current state: 596 automated tests. On Windows (`run-tests.bat --all`, about 6 minutes)
+the 117 bash-script tests are skipped, and 85% of the code is reached (`--cov` shows the rest).
 
 ## How the tests are built
 
@@ -25,22 +25,28 @@ the 106 bash-script tests are skipped, and 85% of the code is reached (`--cov` s
 | Web interface (API) | `test_ui_server.py` | people, naming, merging, moving faces, ignore / restore, review queue, rejections, security (host check, required header, no-network default) |
 | Photos page (API) | `test_photo_browse.py` | listing and paging, every quick filter, year / month / text search (including a literal `%`), person filters (all / any, uncertain), thumbnails and caching, rename rules (Windows-illegal names, clashes, case-only, extension kept), delete to trash, bulk delete (partial failure, limits, duplicates), cleanup of orphaned people |
 | Metadata (phase 6) | `test_metadata.py` | tables, triggers and upgrade of an older index; camera details (make/model, lens, exposure, GPS north/south/east/west, zero GPS, rotated photos, no EXIF, bad values, unreadable files); `sort`, `refresh` (new photos, catch-up for older ones, `--no-metadata`, other libraries untouched, notes survive a move) and the `metadata` command (preview, `--limit`, `--reread`, missing and unreadable files, Ctrl+C and resume); `info`; notes (one per photo, replace, clear, too long), model annotations never overwrite yours; embeddings (32/16-bit, replace, damaged rows, mixed sizes); search (names, folders, partial names, note prefixes, punctuation, accents, edits, renames, without FTS5); the photo API (detail, saving notes, header check, search and *Has notes* filter, delete and rename) |
+| Search by description (phase 7) | `test_clip_search.py` | `clipcheck` with a tiny generated ONNX model: passing and failing picture/word checks, timings and the estimate from the index, missing model, unsafe model names, missing packages, `--gpu` without CUDA, damaged files, `--list`; downloads (every file, only missing ones, unknown model, offline, cut short, Ctrl+C then resume, full disk, generic User-Agent); preprocessing (crop, squash, pad, EXIF rotation, reduced JPEG decoding), fixed-batch models, tokens and padding, SigLIP text cleaning, unsupported multilingual models; `embed`: preview writes nothing, 16-bit unit vectors that match each photo's content, `--limit` then resume, `--again`, other models untouched, one-picture-at-a-time models, no index / model not downloaded / missing packages / unsafe name / `--gpu` without CUDA / damaged model, missing and unreadable photos retried later, the model failing repeatedly, Ctrl+C keeps whole batches only, refusing to mix vector sizes, vectors removed with their photo; web search: best match first, combined with the other filters, paging and the best-N choice, photos without a vector counted, new and replaced vectors picked up, deleted photos gone, the models list (usable or not), no vectors yet, unknown or missing model, missing packages, mixed vector sizes, damaged model, the text half loaded once and only on the CPU |
 | Starting the interface | `test_ui_launch.py` | no index yet, busy port, network exposure warning, Ctrl+C, browser opening, corrupt index |
-| Bash scripts | `test_shell_scripts.py` | menu (every choice, bad input, end of input), option 2 preview → confirm → apply, option 3 refresh → faces → cluster with every stop/continue branch, option 4 camera details preview → confirm → read (re-read, no index, errors, Ctrl+C), remembered folders, quoted paths, Python discovery, `run-tests.sh` flags, `deploy.sh` placeholder refusal, dry run, backups and pruning, stale-file removal, rollback, data/config safety |
+| Bash scripts | `test_shell_scripts.py` | menu (every choice, bad input, end of input), option 2 preview → confirm → apply, option 3 refresh → faces → cluster with every stop/continue branch, option 4 camera details preview → confirm → read (re-read, no index, errors, Ctrl+C), option 5 search preview → (download the model) → confirm → store vectors (remembered model, download declined / failed / stopped, no index, errors, Ctrl+C, missing `tokenizers`), option 6 list → check → (download after asking) with the passing model remembered for option 5, remembered folders, quoted paths, Python discovery, `run-tests.sh` flags, `deploy.sh` placeholder refusal, dry run, backups and pruning, stale-file removal, rollback, data/config safety |
 | Windows scripts | `test_windows_scripts.py` | the same menu, test-runner and deploy scenarios for `scripts/menu.py`, `run_tests.py`, `deploy.py` (what the `.bat` files start); `.bat` files have Windows line endings and call the right script |
-| Browser | `e2e/test_browser.py` | Photos page, naming a person then filtering by their chip, viewer keyboard navigation, rename and delete with confirmations and cancel, writing a note and finding the photo by it, multi-select delete, People / Review pages, no sideways scrolling on a phone, no JavaScript errors |
+| Browser | `e2e/test_browser.py` | Photos page, search by description (greyed out until prepared, best match first, no month headings, note about photos without vectors, best-N choice, viewer, clear), naming a person then filtering by their chip, viewer keyboard navigation, rename and delete with confirmations and cancel, writing a note and finding the photo by it, multi-select delete, People / Review pages, no sideways scrolling on a phone, no JavaScript errors |
 
 ## Not automated: check these by hand
 
 Do these once on the real machine, and again after a big change.
 
 1. **GPU.** `python sort_photos.py gpucheck` reports the GPU provider; a scan with `--gpu` is faster than `--cpu` and finds the same faces.
+   `python sort_photos.py clipcheck --download` with each suggested model: 3 of 3 right, runs on the NVIDIA GPU, note the timings.
+   Then `python sort_photos.py embed --apply --limit 50`: says it runs on the GPU, about the speed `clipcheck` predicted,
+   and a second run continues with the rest.
 2. **Real face quality.** On about 200 of your own photos: do the groups look right, are strangers kept out, are side-on and small faces sent to review rather than mixed in? Adjust thresholds if not.
 3. **Network drive.** Sort 20 photos onto the drive in copy mode, then move mode. Confirm names, dates and that originals survive in copy mode. Unplug / disconnect mid-run and confirm a clean error, then a clean re-run.
 4. **Windows.** Run `photo-sorter.bat` from Command Prompt (the `.bat` launchers can only be exercised on Windows; their Python scripts are tested automatically) and `./photo-sorter.sh` from Git Bash. Try a path with spaces, a drag-and-dropped (quoted) path and a `Z:\` path for options 2 and 3.
 5. **Large library.** With your real library (tens of thousands of photos): refresh time, memory use, Photos page scrolling, thumbnail creation speed.
 6. **Deploy.** `./deploy.sh --dry-run`, then a real deploy to a spare folder, start it from there, then `--rollback`.
 7. **Browsers.** Open the interface in your everyday browser, on your phone (if you use `--host 0.0.0.0`) and check rename, delete and multi-select.
+8. **Search quality.** After `embed` with both models, search the Photos page for ten things you know are in your
+   library ("birthday cake", "beach", "snow", a pet, a car...) with each model and note which finds them higher up.
 
 ## Adding a test
 

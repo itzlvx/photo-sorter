@@ -101,6 +101,52 @@ def test_write_a_note_then_find_the_photo_by_it(page, site):
     assert "Has notes 1" in page.inner_text(".seg")
 
 
+def test_search_by_description(page, site):
+    pytest.importorskip("onnx")
+    pytest.importorskip("onnxruntime")
+    pytest.importorskip("tokenizers")
+    import sqlite3
+
+    import clip_search
+    import photo_meta
+    from clip_fakes import make_model
+
+    open_photos(page, site)
+    box = page.get_by_label("Search by description")
+    assert box.is_disabled() and "option 5" in box.get_attribute("placeholder")   # nothing prepared yet
+
+    make_model(clip_search.default_model_root() / "test-model")   # the private app-data folder the server also uses
+    conn = sqlite3.connect(site.env.db)
+    ids = [r[0] for r in conn.execute("SELECT id FROM photos ORDER BY id")]
+    picks = {ids[0]: [1, 0, 0], ids[1]: [0, 1, 0], ids[2]: [0, 0, 1]}
+    for photo_id in ids[:-1]:                                     # the last photo gets no vector
+        photo_meta.save_embedding(conn, photo_id, "test-model", picks.get(photo_id, [-0.6, -0.6, -0.5]), half=True)
+    conn.commit()
+    conn.close()
+
+    page.reload()                                                 # same address, so load the page again
+    page.wait_for_selector(".photo")
+    box = page.get_by_label("Search by description")
+    page.wait_for_function("!document.querySelector('.field.describe').disabled")
+    box.fill("green")
+    box.press("Enter")
+    page.wait_for_function("location.hash.includes('d=green')")
+    page.wait_for_selector(".describe-note:not([hidden])")
+    assert page.locator(".photos .photo").first.get_attribute("data-id") == str(ids[1])
+    assert page.locator(".photos h2.month").count() == 0                         # ranked, not grouped by month
+    assert "Best matches for “green” first" in page.inner_text(".page-head")
+    assert "1 photo here has no search vector yet" in page.inner_text(".describe-note")
+    assert page.locator(".photos .photo").count() == len(ids) - 1
+
+    page.get_by_label("How many matches").select_option("50")
+    page.wait_for_function("location.hash.includes('top=50')")
+    page.locator(".photos .photo").first.locator(".pbody").click()                # the viewer works on the results
+    page.wait_for_selector(".vimg")
+    page.keyboard.press("Escape")
+    page.get_by_role("button", name="Clear filters").click()
+    page.wait_for_selector(".photos h2.month")
+
+
 def test_rename_asks_first_and_can_be_cancelled(page, site):
     open_photos(page, site)
     page.locator(".photo").first.locator(".pbody").click()

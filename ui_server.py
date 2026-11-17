@@ -158,7 +158,8 @@ class MergeBody(BaseModel):
 # --------------------------------------------------------------------------
 # App
 # --------------------------------------------------------------------------
-def create_app(db_path: Path, allowed_hosts: set[str] | None = None, any_host: bool = False) -> FastAPI:
+def create_app(db_path: Path, allowed_hosts: set[str] | None = None, any_host: bool = False,
+               model_root: Path | None = None) -> FastAPI:
     app = FastAPI(title="Photo sorter", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.db_path = db_path
     app.state.version = 0                 # bumped by every change, so cached data is refreshed
@@ -198,7 +199,14 @@ def create_app(db_path: Path, allowed_hosts: set[str] | None = None, any_host: b
     app.mount("/web", StaticFiles(directory=WEB_DIR), name="web")
 
     from photo_browse import add_photo_routes  # phase 5: browse the whole library
-    add_photo_routes(app, get_db, db_path.parent / "thumbs")
+    try:
+        import clip_search  # phase 7: search by description (the model itself is loaded on the first search)
+        search = clip_search.PhotoSearch(model_root)
+    except ImportError as error:
+        log.debug("Searching by description is not available: %s", error)
+        search = None
+    app.state.search = search
+    add_photo_routes(app, get_db, db_path.parent / "thumbs", search)
 
     # ----------------------------------------------------------- read: summary
     @app.get("/api/summary")

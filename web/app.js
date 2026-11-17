@@ -47,7 +47,7 @@ async function api(path, options = {}) {
   return data;
 }
 
-const plural = (n, word) => `${n.toLocaleString()} ${word}${n === 1 ? "" : "s"}`;
+const plural = (n, word, many = word + "s") => `${n.toLocaleString()} ${n === 1 ? word : many}`;
 const thumb = (id) => `/api/faces/${id}/thumb`;
 const personLabel = (p) => p.name || "Unnamed person";
 const REASONS = {
@@ -592,7 +592,10 @@ function photosHash(f) {
   if (f.year) p.set("year", f.year);
   if (f.year && f.month) p.set("month", f.month);
   if (f.q) p.set("q", f.q);
-  if (f.order === "old") p.set("order", "old");
+  if (f.d) p.set("d", f.d);
+  if (f.d && f.model) p.set("model", f.model);
+  if (f.d && f.top && f.top !== 200) p.set("top", String(f.top));
+  if (f.order === "old" && !f.d) p.set("order", "old");
   const text = p.toString();
   return "#/photos" + (text ? "?" + text : "");
 }
@@ -613,7 +616,7 @@ function photoTile(photo) {
     if (photoSel.size) togglePhoto(photo, e.shiftKey);
     else openViewer(state.photoList.indexOf(photo));
   };
-  return h("div", { class: "photo", "data-id": String(photo.id) },
+  return h("div", { class: "photo", "data-id": String(photo.id), title: photo.score != null ? `Match ${photo.score.toFixed(3)}` : null },
     h("button", { class: "pbody", type: "button", "aria-label": `${photo.name}, ${photo.taken || "undated"}`, onclick: open },
       h("img", { src: `/api/photos/${photo.id}/thumb`, alt: "", loading: "lazy", onerror: (e) => e.target.closest(".photo").classList.add("is-missing") }),
       h("span", { class: "pcap" },
@@ -708,12 +711,16 @@ async function viewPhotos(params) {
     uncertain: params.get("uncertain") === "1",
     filter: params.get("filter") || "", year: params.get("year") || "", month: params.get("month") || "",
     q: params.get("q") || "", order: params.get("order") === "old" ? "old" : "new",
+    d: params.get("d") || "", model: params.get("model") || "", top: Number(params.get("top")) || 200,
   };
   const go = (changes) => { location.hash = photosHash({ ...f, ...changes }); };
-  const filtered = f.person.length || f.filter || f.year || f.q;
+  const filtered = f.person.length || f.filter || f.year || f.q || f.d;
 
-  let lib, chips;
-  try { [lib, chips] = await Promise.all([api("/api/library"), api("/api/people/chips")]); }
+  let lib, chips, smart;
+  try {
+    [lib, chips, smart] = await Promise.all([api("/api/library"), api("/api/people/chips"),
+      api("/api/search/models").catch(() => ({ models: [], default: "", limits: [], unavailable: "" }))]);
+  }
   catch (e) { main.replaceChildren(h("div", { class: "empty" }, h("h2", { text: "Couldn't load the library" }), h("p", { text: e.message }))); return; }
   if (token !== renderToken) return;
 
@@ -764,15 +771,35 @@ async function viewPhotos(params) {
     h("option", { value: "", text: "All months" }),
     ...months.slice().sort((a, b) => a.month.localeCompare(b.month)).map((m) => h("option", { value: m.month, selected: f.month === m.month, text: `${MONTHS[Number(m.month) - 1] || m.month} (${m.count.toLocaleString()})` })));
   const search = h("input", { class: "field", type: "search", value: f.q, placeholder: "Name, folder or note", "aria-label": "Search file names, folders and notes", onchange: (e) => go({ q: e.target.value.trim() }) });
-  const orderSel = h("select", { class: "field", "aria-label": "Order", onchange: (e) => go({ order: e.target.value }) },
+  const orderSel = f.d ? null : h("select", { class: "field", "aria-label": "Order", onchange: (e) => go({ order: e.target.value }) },
     h("option", { value: "new", text: "Newest first", selected: f.order === "new" }), h("option", { value: "old", text: "Oldest first", selected: f.order === "old" }));
+
+  // phase 7: search by description
+  const canDescribe = smart.models.length > 0;
+  const describe = h("input", { class: "field describe", type: "search", value: f.d, maxlength: "300", disabled: !canDescribe && !f.d,
+    placeholder: canDescribe ? "Describe a photo: dog on a beach, birthday cake, snow on the car…" : "Search by description: choose option 5 in the menu first",
+    title: canDescribe ? "Finds photos by what is in them, best match first" : (smart.unavailable || "No photos have search vectors yet. Choose option 5 (Prepare search) in the photo-sorter menu."),
+    "aria-label": "Search by description", onchange: (e) => go({ d: e.target.value.trim() }) });
+  const describeOptions = [];
+  if (f.d && smart.models.length > 1) {
+    describeOptions.push(h("select", { class: "field", "aria-label": "Search model", onchange: (e) => go({ model: e.target.value }) },
+      ...smart.models.map((m) => h("option", { value: m.name, selected: (f.model || smart.default) === m.name,
+        text: `${m.name} (${m.photos.toLocaleString()} photos)${m.ready ? "" : " - not available"}` }))));
+  }
+  if (f.d && smart.limits.length) {
+    describeOptions.push(h("select", { class: "field", "aria-label": "How many matches", onchange: (e) => go({ top: Number(e.target.value) }) },
+      ...smart.limits.map((n) => h("option", { value: String(n), selected: n === f.top, text: `Best ${n.toLocaleString()}` }))));
+  }
+  const describeNote = h("p", { class: "count describe-note", hidden: true });
 
   const total = h("span", { class: "count" });
   const grid = h("div", { class: "photos" });
   const more = h("button", { class: "btn", type: "button", text: "Show more", hidden: true });
   const empty = h("div", { class: "empty", hidden: true });
   main.replaceChildren(...[
-    head("Photos", "Everything in your library, newest first. Pick people to see the photos they are in. Tick photos to delete several at once.", total),
+    head("Photos", f.d ? `Best matches for “${f.d}” first. Other filters still apply.` : "Everything in your library, newest first. Pick people to see the photos they are in. Tick photos to delete several at once.", total),
+    h("div", { class: "toolbar describe-bar" }, describe, ...describeOptions),
+    describeNote,
     h("div", { class: "toolbar" }, seg),
     peopleRow, options.length ? h("div", { class: "toolbar", style: "margin-top:12px" }, ...options) : null,
     h("div", { class: "toolbar", style: "margin-top:14px" }, yearSel, monthSel, search, orderSel,
@@ -787,21 +814,39 @@ async function viewPhotos(params) {
   let lastMonth = null;
   async function load() {
     const query = new URLSearchParams({ person: f.person.join(","), match: f.match, uncertain: String(f.uncertain), filter: f.filter, year: f.year, month: f.month, q: f.q, order: f.order, limit: 96, offset });
-    const data = await api(`/api/photos?${query}`);
+    if (f.d) { query.set("d", f.d); query.set("top", String(f.top)); if (f.model) query.set("model", f.model); }
+    let data;
+    try { data = await api(`/api/photos?${query}`); }
+    catch (e) {
+      if (!f.d || token !== renderToken) throw e;
+      empty.hidden = false;
+      empty.replaceChildren(h("h2", { text: "Searching by description is not ready" }), h("p", { text: e.message }));
+      total.textContent = "";
+      return 0;
+    }
     if (token !== renderToken) return 0;
+    if (data.search && !offset) {
+      const parts = [];
+      if (data.search.without_vectors) parts.push(`${plural(data.search.without_vectors, "photo")} here ${data.search.without_vectors === 1 ? "has" : "have"} no search vector yet, so ${data.search.without_vectors === 1 ? "it" : "they"} can't be found by description. Choose option 5 in the menu to add ${data.search.without_vectors === 1 ? "it" : "them"}.`);
+      if (data.total >= data.search.top) parts.push(`Showing the best ${data.search.top.toLocaleString()}; choose a larger number to see more.`);
+      describeNote.textContent = parts.join(" ");
+      describeNote.hidden = !parts.length;
+    }
     for (const photo of data.photos) {
       const key = (photo.taken || "").slice(0, 7);
-      if (key !== lastMonth) { lastMonth = key; grid.append(h("h2", { class: "month", text: monthHeading(photo.taken) })); }
+      if (!f.d && key !== lastMonth) { lastMonth = key; grid.append(h("h2", { class: "month", text: monthHeading(photo.taken) })); }
       state.photoList.push(photo);
       grid.append(photoTile(photo));
     }
     offset += data.photos.length;
     more.hidden = offset >= data.total;
     shownTotal = data.total;
-    total.textContent = plural(data.total, "photo");
+    total.textContent = f.d ? plural(data.total, "match", "matches") : plural(data.total, "photo");
     empty.hidden = data.total > 0;
     if (!data.total) {
-      empty.replaceChildren(...(filtered
+      empty.replaceChildren(...(f.d
+        ? [h("h2", { text: "No matches" }), h("p", { text: "None of the photos that have a search vector pass the other filters. Try removing a filter." })]
+        : filtered
         ? [h("h2", { text: "No photos match" }), h("p", { text: "Try removing a filter. With several people selected, photos must contain all of them unless you choose Any of them." })]
         : [h("h2", { text: "No photos in the index yet" }), h("p", {}, "Run ", h("code", { text: "python sort_photos.py sort SOURCE DEST --apply" }), " or ", h("code", { text: "refresh DEST --apply" }), " first.")]));
     }

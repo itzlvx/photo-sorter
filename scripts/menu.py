@@ -5,6 +5,8 @@
   photo-sorter.bat sort     intake and sort photos                  (also: 2)
   photo-sorter.bat faces    refresh, find faces, group people       (also: 3)
   photo-sorter.bat metadata read camera details for indexed photos (also: 4)
+  photo-sorter.bat search   store search vectors for indexed photos (also: 5)
+  photo-sorter.bat clipcheck check (and download) a search model  (also: 6)
 
 Settings (all optional): PHOTO_SORTER_PYTHON, PHOTO_SORTER_DB, PHOTO_SORTER_UI_ARGS, PHOTO_SORTER_FACES_ARGS.
 """
@@ -158,13 +160,88 @@ def action_metadata():
     return rc
 
 
+DEFAULT_SEARCH_MODEL = "ViT-L-14-quickgelu__dfn2b"
+MODEL_NOT_DOWNLOADED = 3  # embed's exit code when the model files are not there yet
+
+
+def action_search():
+    header("Prepare search")
+    say("Stores a search vector for every photo in the index, so you can later find photos by typing a description.")
+    say("Your photos are only read, never changed. It uses the NVIDIA GPU if it is set up, and can be stopped with Ctrl+C and run again.")
+    if not ensure_modules("Search", "requirements-search.txt", "tokenizers"):
+        return 1
+    default = conf_get("SEARCH_MODEL") or DEFAULT_SEARCH_MODEL
+    model = clean_path(ask(f"Search model (Enter = {default}; or another, for example ViT-B-16-SigLIP2__webli): ") or "") or default
+    say("First a preview. Nothing is changed yet.")
+    rc = run_py("embed", "--model", model, *DB_ARGS)
+    if rc == MODEL_NOT_DOWNLOADED:
+        if not confirm("Download the model now (size shown above), then check it?", True):
+            say("Nothing was changed.")
+            return 0
+        rc = run_py("clipcheck", "--model", model, "--download", "--no-cpu-compare", *DB_ARGS)
+        if rc == 130:
+            warn("Download stopped. Choose this option again to fetch the rest.")
+            return 130
+        if rc != 0:
+            fail("The model could not be downloaded or did not pass its check (see above). Nothing was changed.")
+            return 1
+    elif rc == 2:
+        fail("The preview could not run (see above): is there an index yet (choose 2 or 3), and is the model name right?")
+        return 1
+    elif rc != 0:
+        fail("The preview could not run (see above). Nothing was changed.")
+        return 1
+    conf_set("SEARCH_MODEL", model)
+    if not confirm("Process the photos now?", True):
+        say("Nothing was changed.")
+        return 0
+    rc = run_py("embed", "--apply", "--model", model, *DB_ARGS)
+    if rc == 0:
+        ok("Done. Searching by description in the web interface is the next step being built.")
+    elif rc == 130:
+        warn("Stopped. Run this option again to continue where it left off.")
+    elif rc == 1:
+        warn("Some photos could not be processed (see above). The rest were saved; they are tried again next time.")
+    else:
+        fail(f"Preparing search did not finish (exit code {rc}).")
+    return rc
+
+
+def action_clipcheck():
+    header("Check a search model")
+    say("Checks that a search model works on this computer and times it, using generated test pictures only (never your photos).")
+    say("A model is only downloaded after you agree.")
+    if not ensure_modules("Search", "requirements-search.txt", "tokenizers"):
+        return 1
+    run_py("clipcheck", "--list")
+    default = conf_get("SEARCH_MODEL") or DEFAULT_SEARCH_MODEL
+    model = clean_path(ask(f"Model to check (Enter = {default}; or a name from the list): ") or "") or default
+    rc = run_py("clipcheck", "--model", model, *DB_ARGS)
+    if rc == MODEL_NOT_DOWNLOADED:
+        if not confirm("Download the model now (size shown above), then check it?", True):
+            say("Nothing was downloaded.")
+            return 0
+        rc = run_py("clipcheck", "--model", model, "--download", *DB_ARGS)
+    if rc == 0:
+        conf_set("SEARCH_MODEL", model)
+        ok("The model works. Option 5 will now offer it by default.")
+    elif rc == 130:
+        warn("Stopped. Choose this option again; a download continues where it stopped.")
+    elif rc == 1:
+        fail("The model did not pass the check (see above).")
+    else:
+        fail("The check could not run (see above): is the model name right?")
+    return rc
+
+
 ACTIONS = {"1": action_ui, "ui": action_ui, "2": action_sort, "sort": action_sort, "3": action_faces, "faces": action_faces,
-           "4": action_metadata, "metadata": action_metadata}
+           "4": action_metadata, "metadata": action_metadata, "5": action_search, "search": action_search,
+           "6": action_clipcheck, "clipcheck": action_clipcheck}
 
 
 def menu():
     while True:
-        print("\nPhoto sorter\n 1) Start the web interface\n 2) Intake and sort photos\n 3) Find faces and group people (refresh)\n 4) Read camera details\n q) Quit")
+        print("\nPhoto sorter\n 1) Start the web interface\n 2) Intake and sort photos\n 3) Find faces and group people (refresh)\n 4) Read camera details\n 5) Prepare search (search vectors)\n 6) Check a search model\n q) Quit")
         choice = ask("Choose: ")
         if choice is None:
             return 0
@@ -178,7 +255,7 @@ def menu():
         elif choice in ("q", "quit", "exit"):
             return 0
         elif choice:
-            warn("Please type 1, 2, 3, 4 or q.")
+            warn("Please type 1, 2, 3, 4, 5, 6 or q.")
 
 
 def main(argv):

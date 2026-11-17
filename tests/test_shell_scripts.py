@@ -38,7 +38,7 @@ FAKE_PYTHON = textwrap.dedent('''\
       sort_photos.py)
         echo "$*" >>"$FAKE_LOG"
         name="${2//[^a-z]/_}"
-        case " $* " in *" --apply "*) var="FAKE_RC_${name}_apply" ;; *) var="FAKE_RC_${name}" ;; esac
+        case " $* " in *" --apply "*) var="FAKE_RC_${name}_apply" ;; *" --download "*) var="FAKE_RC_${name}_download" ;; *) var="FAKE_RC_${name}" ;; esac
         exit "${!var:-0}" ;;
     esac
     exit 0
@@ -180,7 +180,7 @@ def test_menu_ends_cleanly_at_end_of_input(box):
 
 def test_menu_rejects_bad_choices_then_quits(box):
     r = box.run("photo-sorter.sh", stdin="9\nhello\n\nQ\n")
-    assert r.returncode == 0 and r.stderr.count("Please type 1, 2, 3, 4 or q.") == 2 and not r.calls
+    assert r.returncode == 0 and r.stderr.count("Please type 1, 2, 3, 4, 5, 6 or q.") == 2 and not r.calls
 
 
 def test_unknown_argument(box):
@@ -470,6 +470,98 @@ def test_metadata_stop_rules(box):
     for rc, text in ((1, "could not be read"), (130, "Run this option again"), (3, "did not finish")):
         r = box.run("photo-sorter.sh", "metadata", stdin="\ny\n", FAKE_RC_metadata_apply=rc)
         assert r.returncode == rc and text in r.stderr, rc
+
+
+# ===================================================================== photo-sorter.sh: 5) prepare search
+DFN = "ViT-L-14-quickgelu__dfn2b"
+SIGLIP = "ViT-B-16-SigLIP2__webli"
+
+
+@pytest.mark.parametrize("word", ["search", "5"])
+def test_search_previews_then_processes(box, word, tmp_path):
+    db = tmp_path / "i.db"
+    r = box.run("photo-sorter.sh", word, stdin="\ny\n", PHOTO_SORTER_DB=db)
+    assert r.returncode == 0 and box.calls() == [f"sort_photos.py embed --model {DFN} --db {db}",
+                                                 f"sort_photos.py embed --apply --model {DFN} --db {db}"]
+
+
+def test_search_model_choice_is_remembered_decline_and_menu_return(box):
+    box.run("photo-sorter.sh", "search", stdin=f' "{SIGLIP}" \ny\n')
+    assert box.calls() == [f"sort_photos.py embed --model {SIGLIP}", f"sort_photos.py embed --apply --model {SIGLIP}"]
+    box.log.unlink()
+    r = box.run("photo-sorter.sh", "search", stdin="\nn\n")
+    assert r.returncode == 0 and box.calls() == [f"sort_photos.py embed --model {SIGLIP}"]
+    assert "Nothing was changed" in r.stdout + r.stderr
+    box.log.unlink()
+    r = box.run("photo-sorter.sh", stdin="5\n\n\n\nq\n")
+    assert r.returncode == 0 and box.commands() == ["embed", "embed"]
+
+
+def test_search_offers_to_download_a_missing_model(box):
+    r = box.run("photo-sorter.sh", "search", stdin="\ny\ny\n", FAKE_RC_embed=3)
+    assert r.returncode == 0 and box.calls() == [
+        f"sort_photos.py embed --model {DFN}", f"sort_photos.py clipcheck --model {DFN} --download --no-cpu-compare",
+        f"sort_photos.py embed --apply --model {DFN}"]
+    box.log.unlink()
+    r = box.run("photo-sorter.sh", "search", stdin="\nn\n", FAKE_RC_embed=3)
+    assert r.returncode == 0 and box.commands() == ["embed"]
+    box.log.unlink()
+    r = box.run("photo-sorter.sh", "search", stdin="\ny\ny\n", FAKE_RC_embed=3, FAKE_RC_clipcheck_download=1)
+    assert r.returncode == 1 and box.commands() == ["embed", "clipcheck"] and "could not be downloaded" in r.stderr
+    box.log.unlink()
+    r = box.run("photo-sorter.sh", "search", stdin="\ny\ny\n", FAKE_RC_embed=3, FAKE_RC_clipcheck_download=130)
+    assert r.returncode == 130 and "fetch the rest" in r.stderr
+
+
+def test_search_stop_rules(box):
+    r = box.run("photo-sorter.sh", "search", stdin="\ny\n", FAKE_RC_embed=2)
+    assert r.returncode == 1 and "is there an index yet" in r.stderr and box.commands() == ["embed"]
+    for rc, text in ((1, "tried again next time"), (130, "Run this option again"), (4, "did not finish")):
+        r = box.run("photo-sorter.sh", "search", stdin="\ny\n", FAKE_RC_embed_apply=rc)
+        assert r.returncode == rc and text in r.stderr, rc
+
+
+def test_search_offers_to_install_tokenizers(box):
+    r = box.run("photo-sorter.sh", "search", stdin="n\n", FAKE_MISSING="tokenizers")
+    assert r.returncode == 1 and "tokenizers" in r.stderr and box.commands() == []
+
+
+# ===================================================================== photo-sorter.sh: 6) check a search model
+@pytest.mark.parametrize("word", ["clipcheck", "6"])
+def test_clipcheck_lists_checks_and_remembers_the_model(box, word, tmp_path):
+    db = tmp_path / "i.db"
+    r = box.run("photo-sorter.sh", word, stdin="\n", PHOTO_SORTER_DB=db)
+    assert r.returncode == 0 and box.calls() == ["sort_photos.py clipcheck --list", f"sort_photos.py clipcheck --model {DFN} --db {db}"]
+    assert f"SEARCH_MODEL={DFN}" in box.conf_text()
+
+
+def test_clipcheck_choice_becomes_the_default_for_option_5(box):
+    assert box.run("photo-sorter.sh", "clipcheck", stdin=f"{SIGLIP}\n").returncode == 0
+    box.log.unlink()
+    box.run("photo-sorter.sh", "search", stdin="\nn\n")
+    assert box.calls() == [f"sort_photos.py embed --model {SIGLIP}"]
+    box.log.unlink()
+    r = box.run("photo-sorter.sh", stdin="6\n\n\nq\n")
+    assert r.returncode == 0 and box.commands() == ["clipcheck", "clipcheck"]
+
+
+def test_clipcheck_downloads_only_after_asking(box):
+    r = box.run("photo-sorter.sh", "clipcheck", stdin="\ny\n", FAKE_RC_clipcheck=3)
+    assert r.returncode == 0 and box.calls() == ["sort_photos.py clipcheck --list", f"sort_photos.py clipcheck --model {DFN}",
+                                                 f"sort_photos.py clipcheck --model {DFN} --download"]
+    box.log.unlink()
+    r = box.run("photo-sorter.sh", "clipcheck", stdin="\nn\n", FAKE_RC_clipcheck=3)
+    assert r.returncode == 0 and not any("--download" in c for c in box.calls())
+    for rc, text in ((1, "did not pass the check"), (130, "continues where it stopped"), (2, "could not run")):
+        r = box.run("photo-sorter.sh", "clipcheck", stdin="\ny\n", FAKE_RC_clipcheck=3, FAKE_RC_clipcheck_download=rc)
+        assert r.returncode == rc and text in r.stderr, rc
+
+
+def test_clipcheck_failures_are_not_remembered(box):
+    for rc, text in ((1, "did not pass the check"), (2, "is the model name right")):
+        r = box.run("photo-sorter.sh", "clipcheck", stdin="bad\n", FAKE_RC_clipcheck=rc)
+        assert r.returncode == rc and text in r.stderr, rc
+        assert "SEARCH_MODEL" not in box.conf_text()
 
 
 # ===================================================================== run-tests.sh

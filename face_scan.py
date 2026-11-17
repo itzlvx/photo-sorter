@@ -24,14 +24,12 @@ personal photo library.
 """
 from __future__ import annotations
 
-import importlib.metadata as importlib_metadata
 import io
 import math
 import os
 import platform
 import shutil
 import sqlite3
-import subprocess
 import time
 import warnings
 from collections import Counter, deque
@@ -44,6 +42,10 @@ import numpy as np
 from PIL import Image, ImageOps
 
 import sort_photos as sp
+from onnx_setup import (  # noqa: F401  (re-exported: tests and older code use face_scan.<name>)
+    GPU_PROVIDER, GPU_SETUP_STEPS, GPU_TROUBLE, PROVIDER_LABELS, hardware_mode, installed_onnxruntime_packages,
+    nvidia_gpu_summary, pick_providers, preload_cuda_libraries,
+)
 
 log = sp.log
 
@@ -52,19 +54,6 @@ THUMB_MARGIN = 0.4  # extra context around the face box, as a fraction of its si
 BLUR_PATCH = 112  # faces are resized to this before measuring sharpness
 PROGRESS_EVERY = 25
 MAX_CONSECUTIVE_DETECT_FAILURES = 5
-GPU_PROVIDER = "CUDAExecutionProvider"  # NVIDIA
-GPU_SETUP_STEPS = (
-    "To use your NVIDIA GPU, swap in the GPU build of ONNX Runtime in this same virtual environment:\n"
-    "    pip uninstall -y onnxruntime onnxruntime-gpu\n"
-    '    pip install "onnxruntime-gpu[cuda,cudnn]"\n'
-    "(InsightFace installs the CPU build, and the two builds cannot be installed together.)\n"
-    "Then check it with: python sort_photos.py gpucheck"
-)
-PROVIDER_LABELS = {
-    "CUDAExecutionProvider": "NVIDIA GPU (CUDA)",
-    "DmlExecutionProvider": "GPU (DirectML)",
-    "CPUExecutionProvider": "CPU",
-}
 
 
 # --------------------------------------------------------------------------
@@ -78,75 +67,6 @@ def runtime_problem() -> str | None:
     except Exception as error:  # ImportError, or a broken native install
         return f"{type(error).__name__}: {error}"
     return None
-
-
-def hardware_mode(args) -> str:
-    """'cpu' (--cpu), 'gpu' (--gpu: NVIDIA required) or 'auto' (use a GPU if one is set up)."""
-    if getattr(args, "cpu", False):
-        return "cpu"
-    return "gpu" if getattr(args, "gpu", False) else "auto"
-
-
-def pick_providers(mode: str = "auto") -> tuple[list[str], bool]:
-    """Choose the ONNX Runtime providers. Returns (providers, uses_gpu).
-
-    Raises RuntimeError in 'gpu' mode if this ONNX Runtime has no NVIDIA CUDA support.
-    """
-    import onnxruntime as ort
-
-    available = ort.get_available_providers()
-    if mode == "cpu":
-        return ["CPUExecutionProvider"], False
-    if GPU_PROVIDER in available:
-        return [GPU_PROVIDER, "CPUExecutionProvider"], True
-    if mode == "gpu":
-        raise RuntimeError(
-            "--gpu was given, but the installed ONNX Runtime has no NVIDIA CUDA support "
-            f"(it offers: {', '.join(available)}).\n{GPU_SETUP_STEPS}"
-        )
-    if "DmlExecutionProvider" in available:  # DirectML build: any DirectX 12 GPU
-        return ["DmlExecutionProvider", "CPUExecutionProvider"], True
-    return ["CPUExecutionProvider"], False
-
-
-def preload_cuda_libraries() -> str | None:
-    """Ask ONNX Runtime to load the CUDA/cuDNN libraries (including ones pip installed). Returns a problem or None."""
-    import onnxruntime as ort
-
-    preload = getattr(ort, "preload_dlls", None)
-    if preload is None:
-        return None
-    try:
-        preload()
-    except Exception as error:
-        return f"{type(error).__name__}: {error}"
-    return None
-
-
-def installed_onnxruntime_packages() -> dict[str, str]:
-    found = {}
-    for name in ("onnxruntime", "onnxruntime-gpu", "onnxruntime-directml"):
-        try:
-            found[name] = importlib_metadata.version(name)
-        except importlib_metadata.PackageNotFoundError:
-            pass
-    return found
-
-
-def nvidia_gpu_summary() -> str | None:
-    """GPU name, driver and memory from nvidia-smi, or None if it is not available."""
-    exe = shutil.which("nvidia-smi")
-    if not exe:
-        return None
-    try:
-        result = subprocess.run(
-            [exe, "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=15,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    return "; ".join(lines) if result.returncode == 0 and lines else None
 
 
 def model_root_path(model_root: Path | None) -> Path:
@@ -625,12 +545,7 @@ def gpu_check(args) -> int:
         gpu_engine = FaceEngine(args.model, args.model_root, args.det_size, 0.5, "gpu")
     except Exception as error:
         log.error("The GPU could not be used: %s", error)
-        log.error(
-            "Common causes: an out-of-date NVIDIA driver; the CUDA/cuDNN libraries missing (install the GPU build "
-            'with the extras: pip install "onnxruntime-gpu[cuda,cudnn]"); or a GPU too old for this build. '
-            "The current onnxruntime-gpu targets CUDA 13, which needs a recent driver and a GTX 16-series/RTX 20-series "
-            'or newer GPU. For an older GPU try the CUDA 12 build: pip install "onnxruntime-gpu[cuda,cudnn]==1.26.0".'
-        )
+        log.error(GPU_TROUBLE)
         return 1
     log.info("Every model part is running on: %s", PROVIDER_LABELS.get(gpu_engine.provider, gpu_engine.provider))
 
