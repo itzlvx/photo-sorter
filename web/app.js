@@ -192,6 +192,8 @@ function renderRail() {
     link("#/photos", "Photos", s.photos),
     link("#/people", "People", s.people), link("#/review", "Review", s.review, true),
     link("#/unassigned", "Unassigned", s.unassigned), link("#/ignored", "Ignored", s.ignored),
+    h("a", { class: "nav-link nav-tasks", href: "#/tasks", "aria-current": here.startsWith("#/tasks") ? "page" : false },
+      h("span", { text: "Tasks" }), job.current && job.current.state === "running" ? h("span", { class: "count is-running", text: "running" }) : null),
     foot,
   );
 }
@@ -379,7 +381,7 @@ function noFacesHelp() {
   const s = state.summary || {};
   if (!s.faces) {
     return [h("h2", { text: "No faces found yet" }),
-      h("p", {}, "Scan your photos first: ", h("code", { text: "python sort_photos.py faces --apply" }), " then ", h("code", { text: "python sort_photos.py cluster --apply" }), ".")];
+      h("p", {}, "Find the faces in your photos first, on the ", h("a", { href: "#/tasks", text: "Tasks page" }), ".")];
   }
   return [h("h2", { text: "No people yet" }), h("p", { text: "The faces haven't been grouped. Choose Place new faces in the left column." })];
 }
@@ -777,8 +779,8 @@ async function viewPhotos(params) {
   // phase 7: search by description
   const canDescribe = smart.models.length > 0;
   const describe = h("input", { class: "field describe", type: "search", value: f.d, maxlength: "300", disabled: !canDescribe && !f.d,
-    placeholder: canDescribe ? "Describe a photo: dog on a beach, birthday cake, snow on the car…" : "Search by description: choose option 5 in the menu first",
-    title: canDescribe ? "Finds photos by what is in them, best match first" : (smart.unavailable || "No photos have search vectors yet. Choose option 5 (Prepare search) in the photo-sorter menu."),
+    placeholder: canDescribe ? "Describe a photo: dog on a beach, birthday cake, snow on the car…" : "Search by description: prepare search on the Tasks page first (or option 5 in the menu)",
+    title: canDescribe ? "Finds photos by what is in them, best match first" : (smart.unavailable || "No photos have search vectors yet. Use Prepare search on the Tasks page (or option 5 in the photo-sorter menu)."),
     "aria-label": "Search by description", onchange: (e) => go({ d: e.target.value.trim() }) });
   const describeOptions = [];
   if (f.d && smart.models.length > 1) {
@@ -827,7 +829,7 @@ async function viewPhotos(params) {
     if (token !== renderToken) return 0;
     if (data.search && !offset) {
       const parts = [];
-      if (data.search.without_vectors) parts.push(`${plural(data.search.without_vectors, "photo")} here ${data.search.without_vectors === 1 ? "has" : "have"} no search vector yet, so ${data.search.without_vectors === 1 ? "it" : "they"} can't be found by description. Choose option 5 in the menu to add ${data.search.without_vectors === 1 ? "it" : "them"}.`);
+      if (data.search.without_vectors) parts.push(`${plural(data.search.without_vectors, "photo")} here ${data.search.without_vectors === 1 ? "has" : "have"} no search vector yet, so ${data.search.without_vectors === 1 ? "it" : "they"} can't be found by description. Use Prepare search on the Tasks page (or option 5 in the menu) to add ${data.search.without_vectors === 1 ? "it" : "them"}.`);
       if (data.total >= data.search.top) parts.push(`Showing the best ${data.search.top.toLocaleString()}; choose a larger number to see more.`);
       describeNote.textContent = parts.join(" ");
       describeNote.hidden = !parts.length;
@@ -848,7 +850,7 @@ async function viewPhotos(params) {
         ? [h("h2", { text: "No matches" }), h("p", { text: "None of the photos that have a search vector pass the other filters. Try removing a filter." })]
         : filtered
         ? [h("h2", { text: "No photos match" }), h("p", { text: "Try removing a filter. With several people selected, photos must contain all of them unless you choose Any of them." })]
-        : [h("h2", { text: "No photos in the index yet" }), h("p", {}, "Run ", h("code", { text: "python sort_photos.py sort SOURCE DEST --apply" }), " or ", h("code", { text: "refresh DEST --apply" }), " first.")]));
+        : [h("h2", { text: "No photos in the index yet" }), h("p", {}, "Sort your first photos into the library on the ", h("a", { href: "#/tasks", text: "Tasks page" }), ".")]));
     }
     return data.photos.length;
   }
@@ -1058,6 +1060,269 @@ async function openViewer(start) {
   show(index);
 }
 
+// ---------------------------------------------------------------- tasks: sort, faces, search (phase 7.5)
+const job = { current: null, lines: [], next: 0, timer: null, lastState: null };
+const JOB_STATES = {
+  running: ["Running", "running"], finished: ["Finished", "ok"], problems: ["Finished with some problems", "warn"],
+  failed: ["Did not finish", "bad"], stopped: ["Stopped", "warn"],
+};
+const STEP_MARKS = { waiting: "", running: "…", ok: "✓", problems: "!", failed: "✕", stopped: "■", skipped: "–" };
+
+function takeJob(data) {
+  if (!data) { job.current = null; job.lines = []; job.next = 0; return; }
+  if (!job.current || job.current.id !== data.id || data.first > job.next) { job.lines = []; job.next = data.first; }
+  if (data.dropped) job.lines.push("… (earlier lines are no longer kept)");
+  job.lines.push(...data.lines);
+  if (job.lines.length > 4000) job.lines.splice(0, job.lines.length - 4000);
+  job.next = data.next;
+  job.current = data;
+}
+
+async function pollJob() {
+  clearTimeout(job.timer);
+  try {
+    const data = (await api(`/api/jobs/current?after=${job.current ? job.next : 0}`)).job;
+    const before = job.current && job.current.state;
+    takeJob(data);
+    renderJobPanel();
+    if (before === "running" && data && data.state !== "running") jobDone(data);
+  } catch { /* the server may be busy; try again */ }
+  if (job.current && job.current.state === "running") job.timer = setTimeout(pollJob, 800);
+  renderRail();
+}
+
+async function jobDone(data) {
+  const [label] = JOB_STATES[data.state] || ["Done"];
+  toast(`${data.title}: ${label.toLowerCase()}`, data.state === "failed" ? "error" : "");
+  await refreshSummary().catch(() => {});
+}
+
+async function startTask(path, body) {
+  try {
+    const data = await api(path, { body });
+    job.current = data; job.lines = []; job.next = 0;
+    if (!location.hash.startsWith("#/tasks")) location.hash = "#/tasks";
+    renderJobPanel();
+    const panel = document.getElementById("job-panel");
+    if (panel) panel.scrollIntoView({ block: "start", behavior: "smooth" });
+    pollJob();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function stopJob() {
+  if (!(await ask({ title: "Stop this task?", text: "The photo in progress is finished first, and everything done so far is kept. Run the task again later to continue.", confirmLabel: "Stop", danger: true }))) return;
+  try { await api("/api/jobs/current/stop", { body: {} }); pollJob(); } catch (e) { toast(e.message, "error"); }
+}
+
+function jobNextActions(j) {
+  const ok = j.state === "finished" || j.state === "problems";
+  const p = j.params || {};
+  const out = [];
+  if (j.kind === "sort" && !j.apply && ok) {
+    out.push(h("button", { class: "btn primary", type: "button", text: p.move ? "Move these photos" : "Copy these photos", onclick: async () => {
+      if (p.move && !(await ask({ title: "Move the photos?", text: `Each original in ${p.source} is deleted after its copy in the library is checked.`, confirmLabel: "Move them" }))) return;
+      startTask("/api/tasks/sort", { source: p.source, library: p.library, move: p.move, apply: true });
+    } }));
+  }
+  if (j.kind === "sort" && j.apply && ok) {
+    out.push(h("button", { class: "btn primary", type: "button", text: "Find faces in them", onclick: () => startFaces(p.library) }));
+    out.push(h("a", { class: "btn", href: "#/photos", text: "See the photos" }));
+  }
+  if (j.kind === "search" && !j.apply) {
+    const rc = j.steps[0] && j.steps[0].rc;
+    if (rc === 3 || (ok && !p.downloaded)) out.push(h("button", { class: "btn primary", type: "button", text: "Download the model and process the photos", onclick: () => startSearch(p.model, true) }));
+    else if (ok) out.push(h("button", { class: "btn primary", type: "button", text: "Process the photos", onclick: () => startSearch(p.model, true) }));
+  }
+  if (j.kind === "search" && j.apply && ok) out.push(h("a", { class: "btn primary", href: "#/photos", text: "Search your photos" }));
+  if ((j.kind === "faces" || j.kind === "group") && ok) {
+    out.push(h("a", { class: "btn primary", href: "#/people", text: "Name the people" }));
+    if (state.summary && state.summary.review > 0) out.push(h("a", { class: "btn", href: "#/review", text: `Review ${plural(state.summary.review, "face")}` }));
+  }
+  return out;
+}
+
+function renderJobPanel() {
+  const panel = document.getElementById("job-panel");
+  if (!panel) return;
+  const j = job.current;
+  if (!j) { panel.hidden = true; return; }
+  panel.hidden = false;
+  const steps = h("ol", { class: "steps", hidden: j.steps.length < 2 }, ...j.steps.map((s) =>
+    h("li", { class: "is-" + s.state }, h("span", { class: "mark", "aria-hidden": "true", text: STEP_MARKS[s.state] || "" }), s.label,
+      s.state === "skipped" ? h("span", { class: "count", text: " (not run)" }) : null)));
+  const key = `${j.id}:${j.state}`;
+  let log = panel.querySelector("pre.log");
+  if (panel.dataset.key !== key) {   // rebuilt only when the job or its state changes, so the buttons stay put while it runs
+    const [label, tone] = JOB_STATES[j.state] || [j.state, ""];
+    const running = j.state === "running";
+    const scrolled = log ? log.scrollTop : null;
+    log = h("pre", { class: "log", tabindex: "0", "aria-label": "Messages from the task" });
+    panel.replaceChildren(
+      h("div", { class: "job-head" }, h("h2", { text: j.title }), h("span", { class: "state is-" + tone, text: running ? "Running…" : label }),
+        h("span", { class: "spacer" }),
+        running ? h("button", { class: "btn danger", type: "button", text: "Stop", onclick: stopJob }) : null),
+      steps, log,
+      ...(running ? [] : [h("div", { class: "row" }, ...jobNextActions(j))]),
+    );
+    panel.dataset.key = key;
+    if (scrolled != null) log.scrollTop = scrolled;
+  } else {
+    panel.querySelector("ol.steps").replaceWith(steps);
+  }
+  const text = job.lines.join("\n");
+  if (log.textContent !== text) {
+    const stick = !log.textContent || log.scrollTop + log.clientHeight >= log.scrollHeight - 24;
+    log.textContent = text;
+    if (stick) log.scrollTop = log.scrollHeight;
+  }
+}
+
+/** Choose a folder on this computer. onPick receives the full path. */
+function openFolderPicker({ title, start, onPick }) {
+  const pathInput = h("input", { class: "field", type: "text", spellcheck: "false", "aria-label": "Folder path", placeholder: "Type or paste a folder path" });
+  const go = h("button", { class: "btn", type: "button", text: "Go" });
+  const places = h("div", { class: "places", role: "group", "aria-label": "Places" });
+  const list = h("div", { class: "folder-list", role: "list" });
+  const note = h("p", { class: "count" });
+  const choose = h("button", { class: "btn primary", type: "button", text: "Choose this folder", disabled: true });
+  let here = "";
+  async function load(path) {
+    try {
+      const data = await api(`/api/folders?${new URLSearchParams({ path })}`);
+      here = data.path;
+      pathInput.value = here;
+      pathInput.scrollLeft = pathInput.scrollWidth;   // the end of a long path is the part that matters
+      choose.disabled = !here;
+      places.replaceChildren(...data.shortcuts.map((s) => h("button", { class: "chip", type: "button", title: s.path, onclick: () => load(s.path) }, h("span", { class: "n", text: s.label }))));
+      const rows = [];
+      if (data.parent) rows.push(h("button", { class: "folder up", type: "button", role: "listitem", onclick: () => load(data.parent) }, "↑ Up one level"));
+      for (const f of data.folders) rows.push(h("button", { class: "folder", type: "button", role: "listitem", title: f.path, onclick: () => load(f.path) }, f.name));
+      list.replaceChildren(...rows);
+      note.textContent = !here ? "Choose a place to start." : data.folders.length ? (data.truncated ? `Showing the first ${data.folders.length.toLocaleString()} folders.` : "") : "No folders inside this one.";
+    } catch (e) {
+      if (path && e.status === 404) {   // a folder that doesn't exist yet: start from the closest one that does
+        const parent = path.replace(/[\\/]+$/, "").replace(/[\\/][^\\/]*$/, "");
+        if (parent && parent !== path) { await load(/^[A-Za-z]:$/.test(parent) ? parent + "\\" : parent); note.textContent = `${path} doesn't exist yet. It is created when photos are sorted into it — you can type it above.`; pathInput.value = path; here = path; choose.disabled = false; return; }
+      }
+      note.textContent = e.message;
+      if (path) load("");
+    }
+  }
+  go.addEventListener("click", () => load(pathInput.value.trim()));
+  pathInput.addEventListener("keydown", (e) => { if (e.key === "Enter") go.click(); });
+  pathInput.addEventListener("input", () => { choose.disabled = !pathInput.value.trim(); });
+  const cancel = h("button", { class: "btn", type: "button", text: "Cancel" });
+  const dialog = openDialog(h("div", { class: "dlg" }, h("h2", { text: title }), h("div", { class: "new-row" }, pathInput, go), places, list, note,
+    h("div", { class: "row" }, cancel, choose)), { wide: false });
+  cancel.addEventListener("click", () => dialog.close());
+  choose.addEventListener("click", () => { const value = pathInput.value.trim(); if (value) { dialog.close(); onPick(value); } });
+  load(start || "");
+}
+
+function folderField(label, value, hint, pickerTitle) {
+  const input = h("input", { class: "field", type: "text", value: value || "", spellcheck: "false", placeholder: "Full path, for example D:\\Photos", "aria-label": label });
+  const browse = h("button", { class: "btn", type: "button", text: "Browse…", onclick: () => openFolderPicker({ title: pickerTitle, start: input.value.trim(), onPick: (path) => { input.value = path; input.dispatchEvent(new Event("change")); } }) });
+  const wrap = h("div", { class: "task-field" }, h("span", { class: "lbl", text: label }), h("span", { class: "folder-row" }, input, browse), hint ? h("span", { class: "hint", text: hint }) : null);
+  wrap.input = input;
+  return wrap;
+}
+
+function segChoice(label, options, initial) {
+  let value = initial;
+  const buttons = options.map(([v, text]) => h("button", { type: "button", "aria-pressed": String(v === value), onclick: () => { value = v; buttons.forEach((b, i) => b.setAttribute("aria-pressed", String(options[i][0] === v))); } }, text));
+  const el = h("div", { class: "task-field" }, h("span", { class: "lbl", text: label }), h("div", { class: "seg", role: "group", "aria-label": label }, ...buttons));
+  el.get = () => value;
+  return el;
+}
+
+function startFaces(library, extra = {}) {
+  if (!library) { toast("Choose the library folder first.", "error"); return; }
+  startTask("/api/tasks/faces", { library, ...extra });
+}
+
+async function startSearch(model, apply) {
+  if (!model) return;
+  const info = await api("/api/tasks").catch(() => null);
+  const m = info && info.search.models.find((x) => x.name === model);
+  if (apply && m && !m.downloaded) {
+    if (!(await ask({ title: "Download the search model?", text: `${model} is about ${m.size}. It is downloaded once from Hugging Face (huggingface.co/immich-app) and kept on this computer. Then every photo gets a search vector.`, confirmLabel: "Download and process" }))) return;
+    return startTask("/api/tasks/search", { model, apply: true, download: true });
+  }
+  startTask("/api/tasks/search", { model, apply });
+}
+
+async function viewTasks() {
+  const token = ++renderToken;
+  let info;
+  try { info = await api("/api/tasks"); }
+  catch (e) { main.replaceChildren(h("div", { class: "empty" }, h("h2", { text: "Couldn't load the tasks" }), h("p", { text: e.message }))); return; }
+  if (token !== renderToken) return;
+  if (info.job && (!job.current || job.current.id !== info.job.id || job.current.state !== info.job.state)) { job.current = null; takeJob(info.job); }
+
+  const busy = () => job.current && job.current.state === "running";
+  const guard = (fn) => () => { if (busy()) toast("Another task is still running. Wait for it, or stop it first.", "error"); else fn(); };
+
+  // sort new photos
+  const source = folderField("New photos", info.folders.source, "The folder with the photos to add. Folders inside it are included.", "Folder with the new photos");
+  const library = folderField("Library", info.folders.library, "Photos go into Year\\Month folders here, for example 2024\\03-mar.", "Your library folder");
+  const how = segChoice("Copy or move", [["copy", "Copy"], ["move", "Move"]], "copy");
+  const sortCard = h("section", { class: "task-card", "aria-labelledby": "t-sort" },
+    h("h2", { id: "t-sort", text: "Sort new photos" }),
+    h("p", { text: "Copies photos into your library by the date they were taken, and skips any that are already there. First a preview shows what would happen; nothing changes until you agree." }),
+    source, library, how,
+    h("p", { class: "hint", text: "Copy keeps your originals where they are. Move deletes each original only after its copy is checked." }),
+    h("div", { class: "row" }, h("button", { class: "btn primary", type: "button", text: "Preview", onclick: guard(() =>
+      startTask("/api/tasks/sort", { source: source.input.value.trim(), library: library.input.value.trim(), move: how.get() === "move" })) })));
+
+  // faces
+  const facesLib = folderField("Library", info.folders.library, null, "Your library folder");
+  library.input.addEventListener("change", () => { if (!facesLib.input.value.trim()) facesLib.input.value = library.input.value; });
+  const limit = h("input", { class: "field", type: "number", min: "1", step: "1", inputmode: "numeric", placeholder: "All new photos", "aria-label": "How many photos to scan" });
+  const hardware = segChoice("Hardware", [["auto", "Automatic"], ["gpu", "GPU only"], ["cpu", "CPU only"]], "auto");
+  const facesMissing = info.packages.faces;
+  const facesCard = h("section", { class: "task-card", id: "t-faces-card", "aria-labelledby": "t-faces" },
+    h("h2", { id: "t-faces", text: "Find faces and group people" }),
+    h("p", { text: "Updates the index from your library, finds the faces in photos not scanned yet, then groups them into people. Your photos are only read. It can be stopped and continued later." }),
+    facesMissing ? h("p", { class: "task-warn", text: facesMissing }) : null,
+    facesLib,
+    h("label", { class: "task-field" }, h("span", { class: "lbl", text: "How many photos" }), limit, h("span", { class: "hint", text: "Leave empty for all new photos, or type a small number for a quick test." })),
+    hardware,
+    h("div", { class: "row" },
+      h("button", { class: "btn", type: "button", text: "Group faces only", title: "Place faces that are already found, without scanning", onclick: guard(() => startTask("/api/tasks/group", {})) }),
+      h("button", { class: "btn primary", type: "button", text: "Start", disabled: !!facesMissing, onclick: guard(() => {
+        const n = limit.value.trim();
+        if (n && !(Number(n) >= 1)) { toast("How many photos must be a number, or empty for all.", "error"); return; }
+        startFaces(facesLib.input.value.trim(), { limit: n ? Math.floor(Number(n)) : null, hardware: hardware.get() });
+      }) })));
+
+  // search vectors
+  const models = info.search.models;
+  const searchMissing = info.packages.search;
+  const select = h("select", { class: "field", "aria-label": "Search model" }, ...models.map((m) =>
+    h("option", { value: m.name, selected: m.name === info.search.default }, `${m.name} — ${m.downloaded ? "downloaded" : "about " + m.size}`)));
+  const about = h("span", { class: "hint" });
+  const describe = () => { const m = models.find((x) => x.name === select.value); about.textContent = m ? (m.about ? m.about[0].toUpperCase() + m.about.slice(1) + ". " : "") + (m.downloaded ? "Already on this computer." : `Downloaded once (about ${m.size}) when you process the photos.`) : ""; };
+  select.addEventListener("change", describe);
+  describe();
+  const searchCard = h("section", { class: "task-card", "aria-labelledby": "t-search" },
+    h("h2", { id: "t-search", text: "Prepare search" }),
+    h("p", { text: "Lets you find photos by typing a description on the Photos page. Each photo is looked at once by the search model; photos that already have a search vector are skipped." }),
+    searchMissing ? h("p", { class: "task-warn", text: searchMissing }) : null,
+    models.length ? h("label", { class: "task-field" }, h("span", { class: "lbl", text: "Search model" }), select, about) : null,
+    h("div", { class: "row" },
+      h("button", { class: "btn", type: "button", text: "Preview", disabled: !!searchMissing || !models.length, onclick: guard(() => startSearch(select.value, false)) }),
+      h("button", { class: "btn primary", type: "button", text: "Process photos", disabled: !!searchMissing || !models.length, onclick: guard(() => startSearch(select.value, true)) })));
+
+  main.replaceChildren(
+    head("Tasks", "Bring new photos into your library, find the faces in them and prepare search. You can leave this page while a task runs."),
+    h("section", { class: "job", id: "job-panel", "aria-live": "polite", hidden: true }),
+    h("div", { class: "tasks" }, sortCard, facesCard, searchCard),
+  );
+  renderJobPanel();
+  if (busy()) pollJob();
+  state.reload = () => viewTasks();
+}
+
 // ---------------------------------------------------------------- router
 function route() {
   photoSel.clear(); lastPicked = null; selbar.hidden = true;
@@ -1071,14 +1336,16 @@ function route() {
   if (section === "people" && arg) return viewPerson(Number(arg));
   if (section === "review") return viewReview(arg);
   if (section === "unassigned" || section === "ignored") return viewScope(section);
+  if (section === "tasks") return viewTasks();
   return viewPeople();
 }
 
 async function init() {
   try { await refreshSummary(); }
   catch (e) { main.replaceChildren(h("div", { class: "empty" }, h("h2", { text: "Can't reach the photo sorter" }), h("p", { text: e.message }))); return; }
-  if (!location.hash) location.replace(state.summary.review > 0 ? "#/review" : "#/people");
+  if (!location.hash) location.replace(!state.summary.photos ? "#/tasks" : state.summary.review > 0 ? "#/review" : "#/people");
   window.addEventListener("hashchange", route);
   route();
+  pollJob();   // a task started earlier may still be running
 }
 init();

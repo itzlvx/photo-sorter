@@ -13,6 +13,7 @@ What you can do in the interface
   * move faces between people, or start a new person from some faces
   * see the whole photo behind any face
   * place newly scanned faces with one click (runs the phase 3 grouping)
+  * sort new photos, find faces and prepare search from the Tasks page (phase 7.5, ui_tasks.py)
 
 Choices you make here are protected from the AI: confirmed faces, named people,
 merged people and ignored faces are never moved by 'cluster', even with --recluster.
@@ -22,6 +23,7 @@ and every change must carry a header that web pages on other sites cannot send.
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import logging
 import re
@@ -159,8 +161,13 @@ class MergeBody(BaseModel):
 # App
 # --------------------------------------------------------------------------
 def create_app(db_path: Path, allowed_hosts: set[str] | None = None, any_host: bool = False,
-               model_root: Path | None = None) -> FastAPI:
-    app = FastAPI(title="Photo sorter", docs_url=None, redoc_url=None, openapi_url=None)
+               model_root: Path | None = None, job_command: list[str] | None = None) -> FastAPI:
+    @contextlib.asynccontextmanager
+    async def lifespan(app: FastAPI):
+        yield
+        app.state.jobs.shutdown()  # never leave a task running after the web interface stops
+
+    app = FastAPI(title="Photo sorter", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.db_path = db_path
     app.state.version = 0                 # bumped by every change, so cached data is refreshed
     app.state.centroids = None
@@ -207,6 +214,15 @@ def create_app(db_path: Path, allowed_hosts: set[str] | None = None, any_host: b
         search = None
     app.state.search = search
     add_photo_routes(app, get_db, db_path.parent / "thumbs", search)
+
+    import ui_tasks  # phase 7.5: sort, find faces and prepare search from the Tasks page
+
+    def job_finished(job) -> None:
+        app.state.centroids = None
+        changed()
+
+    app.state.jobs = ui_tasks.JobRunner(command=job_command, on_finish=job_finished)
+    ui_tasks.add_task_routes(app, db_path, app.state.jobs, model_root, regroup_busy=app.state.regroup_lock.locked)
 
     # ----------------------------------------------------------- read: summary
     @app.get("/api/summary")
@@ -618,6 +634,8 @@ def create_app(db_path: Path, allowed_hosts: set[str] | None = None, any_host: b
     @app.post("/api/regroup")
     def regroup():
         """Run the phase 3 grouping for faces that are new or still uncertain."""
+        if app.state.jobs.busy():
+            raise HTTPException(409, f"'{app.state.jobs.job.title}' is running on the Tasks page. Try again when it has finished.")
         if not app.state.regroup_lock.acquire(blocking=False):
             raise HTTPException(409, "Grouping is already running.")
         lines: list[str] = []
@@ -678,9 +696,9 @@ def run_ui(args) -> int:
     db_path = (args.db or sp.default_db_path()).resolve()
     sp.log_index_location(db_path, True)
     if not db_path.exists():
-        log.error("There is no index yet. Run 'sort ... --apply' (or 'refresh ... --apply'), then 'faces --apply' and 'cluster --apply'.")
-        return 2
+        log.info("There is no index yet, so an empty one is made. Sort your first photos on the Tasks page.")
     try:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
         sp.open_index(db_path).close()  # make sure the newest tables exist
     except (OSError, sqlite3.Error) as error:
         log.error("Cannot open the index %s: %s", db_path, error)

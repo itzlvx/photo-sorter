@@ -83,6 +83,7 @@ def isolated_machine(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
+    monkeypatch.setenv("PHOTO_SORTER_CONF", str(tmp_path / "photo-sorter.conf"))
 
 
 @pytest.fixture

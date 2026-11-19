@@ -197,7 +197,7 @@ def action_search():
         return 0
     rc = run_py("embed", "--apply", "--model", model, *DB_ARGS)
     if rc == 0:
-        ok("Done. Searching by description in the web interface is the next step being built.")
+        ok("Done. Choose 1 to open the web interface and type a description on the Photos page.")
     elif rc == 130:
         warn("Stopped. Run this option again to continue where it left off.")
     elif rc == 1:

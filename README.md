@@ -352,6 +352,33 @@ The box is greyed out until some photos have search vectors. The first search af
 text half of the model (a few seconds); after that a search takes about 0.1 s. Searching runs on the CPU, so the GPU
 stays free for face scanning and `embed`.
 
+### Phase 7.5: the **Tasks** page (sort, find faces and prepare search without the menu)
+
+Everything the menu does for new photos can now be done from the web interface. Open **Tasks** in the left column
+(it opens there by itself while the index is still empty, so you can start with `python sort_photos.py ui` alone).
+
+- **Sort new photos.** Choose the folder with the new photos and your library, either by typing or pasting a path or
+  with **Browse…**, which lists the folders on this computer (with shortcuts to Home, Pictures, your library and every
+  drive). The library folder doesn't have to exist yet. Choose **Copy** (originals stay) or **Move** (each original is
+  deleted only after its copy is checked), then **Preview**. Nothing changes until you press **Copy these photos** /
+  **Move these photos** under the preview.
+- **Find faces and group people.** Refreshes the index from the library, scans the photos that haven't been scanned,
+  then groups the faces, the same three steps as menu option 3. Optionally limit how many photos are scanned (for a
+  quick test) and choose GPU or CPU. **Group faces only** runs just the last step.
+- **Prepare search.** Choose a search model (the list says which are downloaded and how big the others are), then
+  **Preview** or **Process photos**. A model that isn't downloaded yet is fetched once after you agree, then checked.
+
+While a task runs, its messages appear live on the page, each step is ticked off, and the left column shows
+**running**. You can go to other pages meanwhile. **Stop** works like Ctrl+C: the photo in progress is finished, all
+work so far is kept, and running the task again continues where it stopped. Only one task runs at a time, because they
+all write to the same index. When a task finishes, the page offers the obvious next step (for example **Find faces in
+them** after sorting, **Name the people** after grouping).
+
+Each task runs the same `sort_photos.py` command you would type, against the index the interface is using, and the
+folders and search model you choose are remembered in `.photo-sorter.conf` (shared with the menu). Missing Python
+packages are pointed out on the page, with the `pip install` command to run. Stopping the web interface also stops a
+task that is still running.
+
 ### The whole workflow
 
     python sort_photos.py sort SOURCE DEST --apply     # or: refresh DEST --apply for a library that is already sorted
@@ -359,6 +386,7 @@ stays free for face scanning and `embed`.
     python sort_photos.py cluster --apply              # group them into people
     python sort_photos.py ui                           # name people, review, merge
     # later, after adding photos: sort/refresh, faces --apply, then "Place new faces" in the UI (or cluster --apply)
+    # or do all of it from the Tasks page of the web interface (phase 7.5)
 
 ## Menu script, tests and deploying
 
@@ -383,5 +411,6 @@ The test plan, with what is automated and what to check by hand, is in `docs/TES
 - Phase 5: browse the whole library with people quick filters, rename and delete with confirmation (done)
 - Phase 6: camera details, notes and a search index (done)
 - Phase 7: search by typing a description (done)
+- Phase 7.5: a Tasks page in the web interface to sort new photos, find faces and prepare search (done)
 - Phase 8 (planned): optional AI captions. The research and design are in [ROADMAP.md](ROADMAP.md).
 - Ideas not built yet: writing people's names into photo metadata or folders, an undo button

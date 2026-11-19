@@ -64,6 +64,7 @@ import hashlib
 import logging
 import os
 import shutil
+import signal
 import sqlite3
 import sys
 import time
@@ -360,7 +361,11 @@ def choose_destination(
 
 def transfer(src: Path, target: Path, move: bool, sha: str) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, target)
+    try:
+        shutil.copy2(src, target)
+    except BaseException:  # failed or stopped half way: never leave a partial copy behind (the original is untouched)
+        target.unlink(missing_ok=True)
+        raise
     if move:
         # Only delete the original after proving the copy is identical.
         if sha256_of(target) != sha:
@@ -527,6 +532,37 @@ def run(args: argparse.Namespace) -> int:
     detail = log.debug if args.apply else log.info  # per-file lines: preview always, apply with -v
 
     log.info("Scanning %s ...", source)
+    try:
+        sort_all(args, source, dest, conn, db_path, seen, reserved, stats, detail, verb)
+    except KeyboardInterrupt:
+        stats["stopped"] = 1
+        log.warning("Stopped by you. Every photo finished so far is sorted and indexed; run the same command again for the rest."
+                    if args.apply else "Stopped by you, part way through the preview.")
+
+    if conn:
+        conn.close()
+
+    log.info("--- Summary ---")
+    log.info("%-22s%d", "Photos scanned:", stats["scanned"])
+    log.info("%-22s%d", "Photos sorted:" if args.apply else "Would sort:", stats["sorted"])
+    log.info("%-22s%d", "Duplicates skipped:", stats["duplicates"])
+    log.info("%-22s%d", "Errors:", stats["errors"])
+    if stats["index_errors"]:
+        log.warning("Index write failures: %d (try --db on a local folder)", stats["index_errors"])
+    for key in sorted(k for k in stats if k.startswith("date:")):
+        log.info("  dated by %s: %d", key[5:], stats[key])
+    if stats["date:file_date"]:
+        log.info("  (file_date means no EXIF date was found; those may be worth a look)")
+    log_index_location(db_path, args.apply)
+    log.info("Finished in %.1f seconds", time.monotonic() - started)
+    if not args.apply:
+        log.info("Dry run only: nothing was changed. Re-run with --apply to sort for real.")
+    if stats["stopped"]:
+        return 130
+    return 1 if stats["errors"] else 0
+
+
+def sort_all(args, source, dest, conn, db_path, seen, reserved, stats, detail, verb) -> None:
     for src in iter_photos(source, exclude=dest):
         stats["scanned"] += 1
         try:
@@ -576,26 +612,6 @@ def run(args: argparse.Namespace) -> int:
                 "Progress: %d scanned, %d sorted, %d duplicates",
                 stats["scanned"], stats["sorted"], stats["duplicates"],
             )
-
-    if conn:
-        conn.close()
-
-    log.info("--- Summary ---")
-    log.info("%-22s%d", "Photos scanned:", stats["scanned"])
-    log.info("%-22s%d", "Photos sorted:" if args.apply else "Would sort:", stats["sorted"])
-    log.info("%-22s%d", "Duplicates skipped:", stats["duplicates"])
-    log.info("%-22s%d", "Errors:", stats["errors"])
-    if stats["index_errors"]:
-        log.warning("Index write failures: %d (try --db on a local folder)", stats["index_errors"])
-    for key in sorted(k for k in stats if k.startswith("date:")):
-        log.info("  dated by %s: %d", key[5:], stats[key])
-    if stats["date:file_date"]:
-        log.info("  (file_date means no EXIF date was found; those may be worth a look)")
-    log_index_location(db_path, args.apply)
-    log.info("Finished in %.1f seconds", time.monotonic() - started)
-    if not args.apply:
-        log.info("Dry run only: nothing was changed. Re-run with --apply to sort for real.")
-    return 1 if stats["errors"] else 0
 
 
 def exif_ids(conn: sqlite3.Connection) -> set[int]:
@@ -1227,4 +1243,6 @@ if __name__ == "__main__":
     if hasattr(sys.stdout, "reconfigure"):  # avoid crashes on odd filenames in the Windows console
         sys.stdout.reconfigure(errors="replace")
         sys.stderr.reconfigure(errors="replace")
+    if hasattr(signal, "SIGBREAK"):  # Windows: Ctrl+Break (and Stop in the web interface) stops as cleanly as Ctrl+C
+        signal.signal(signal.SIGBREAK, signal.default_int_handler)
     sys.exit(main())

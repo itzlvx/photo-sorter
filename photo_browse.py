@@ -321,7 +321,7 @@ def add_photo_routes(app: FastAPI, get_db, thumb_dir: Path, search=None) -> None
             raise HTTPException(409, SEARCH_UNAVAILABLE)
         models = search.stored_models(db)
         if not models:
-            raise HTTPException(409, "No photos have search vectors yet. Choose option 5 in the menu (or run "
+            raise HTTPException(409, "No photos have search vectors yet. Use Prepare search on the Tasks page, choose option 5 in the menu (or run "
                                      "python sort_photos.py embed --apply), then search again.")
         names = [m["name"] for m in models]
         name = model or next((m["name"] for m in models if m["ready"]), names[0])

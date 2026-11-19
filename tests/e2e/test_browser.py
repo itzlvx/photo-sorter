@@ -231,7 +231,7 @@ def test_select_several_and_delete_them(page, site):
 
 
 def test_people_and_review_pages_load(page, site):
-    for route in ("people", "review", "photos"):
+    for route in ("people", "review", "photos", "tasks"):
         page.goto(f"{site.url}/#/{route}")
         page.wait_for_timeout(600)
         assert page.locator("#main").inner_text().strip()
@@ -240,8 +240,35 @@ def test_people_and_review_pages_load(page, site):
 def test_phone_width_has_no_sideways_scroll(browser, site):
     context = browser.new_context(viewport={"width": 390, "height": 800}, is_mobile=True)
     page = context.new_page()
-    for route in ("photos", "people", "review"):
+    for route in ("photos", "people", "review", "tasks"):
         page.goto(f"{site.url}/#/{route}")
         page.wait_for_timeout(700)
         assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth + 1"), route
     context.close()
+
+
+def test_tasks_page_chooses_folders_previews_then_sorts(page, site, tmp_path):
+    from conftest import make_photo
+    incoming = tmp_path / "card" / "DCIM"
+    for i in range(2):
+        make_photo(incoming / f"new{i}.jpg", seed=500 + i, taken=f"2019:07:0{i + 1} 09:00:00")
+    before = len(files(site))
+    page.goto(f"{site.url}/#/tasks")
+    page.get_by_role("heading", name="Sort new photos").wait_for()
+
+    page.get_by_role("button", name="Browse…").first.click()         # choose the folder by clicking through it
+    picker = page.locator("dialog")
+    picker.get_by_label("Folder path").fill(str(tmp_path / "card"))
+    picker.get_by_role("button", name="Go").click()
+    picker.get_by_role("listitem").filter(has_text="DCIM").click()
+    page.wait_for_function("document.querySelector('dialog input').value.endsWith('DCIM')")
+    picker.get_by_role("button", name="Choose this folder").click()
+    assert page.get_by_label("New photos", exact=True).input_value() == str(incoming)
+
+    page.get_by_label("Library", exact=True).first.fill(str(site.library))
+    page.get_by_role("button", name="Preview").first.click()
+    page.get_by_role("button", name="Copy these photos").click()     # offered once the preview has finished
+    page.get_by_role("button", name="Find faces in them").wait_for(timeout=60000)
+    assert "Photos sorted:" in page.locator("pre.log").inner_text()
+    assert len(files(site)) == before + 2 and (site.library / "2019" / "07-jul" / "new0.jpg").exists()
+    assert len(list(incoming.iterdir())) == 2                        # copied, the originals stay

@@ -180,7 +180,7 @@ action_search() {
   run_py embed --apply --model "$model" ${DB_ARGS[@]+"${DB_ARGS[@]}"}
   rc=$?
   case "$rc" in
-    0)   ok "Done. Searching by description in the web interface is the next step being built." ;;
+    0)   ok "Done. Choose 1 to open the web interface and type a description on the Photos page." ;;
     130) warn "Stopped. Run this option again to continue where it left off." ;;
     1)   warn "Some photos could not be processed (see above). The rest were saved; they are tried again next time." ;;
     *)   fail "Preparing search did not finish (exit code $rc)." ;;

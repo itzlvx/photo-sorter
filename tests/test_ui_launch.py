@@ -9,6 +9,7 @@ uvicorn = pytest.importorskip("uvicorn")
 
 import sort_photos as sp  # noqa: E402
 import ui_server  # noqa: E402
+from conftest import scalar  # noqa: E402
 
 
 @pytest.fixture
@@ -28,9 +29,10 @@ def run(cli, *extra, port=None, **kw):
     return cli("ui", "--no-browser", "--port", str(port or free_port()), *extra, **kw)
 
 
-def test_no_index_yet(env, cli, started):
+def test_no_index_yet_makes_an_empty_one_so_the_tasks_page_can_sort(env, cli, started):
     r = run(cli)
-    assert r.code == 2 and "no index yet" in r.err.lower() and not started
+    assert r.code == 0 and "no index yet" in r.out.lower() and "Tasks page" in r.out and started
+    assert scalar(env.db, "SELECT COUNT(*) FROM photos") == 0
 
 
 def test_starts_on_loopback_by_default(env, cli, started, face_index):

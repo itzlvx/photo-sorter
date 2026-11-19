@@ -1,13 +1,14 @@
 # Photo sorter: roadmap and research notes
 
-Status as of 2026-11-16. Phases 1 to 7 are built (sort, faces, grouping, web UI to name people, browsing, metadata,
-search by description). Phase 8 is optional and not started.
+Status as of 2026-11-16. Phases 1 to 7.5 are built (sort, faces, grouping, web UI to name people, browsing, metadata,
+search by description, and running all of it from the web UI). Phase 8 is optional and not started.
 
 | Phase | What | State |
 |---|---|---|
 | 5 | Browse the whole library in the UI, with quick filters for recognised people | Built |
 | 6 | A general place for photo metadata that is not about faces | Built |
 | 7 | Search by typing a description ("birthday cake", "dog on a beach") | Built |
+| 7.5 | A Tasks page in the web UI: choose folders, sort new photos, find faces, group, prepare search | Built |
 | 8 | Optional: written captions from a local vision-language model | Planned, optional, heavy |
 
 ## Requirement as understood
@@ -188,6 +189,33 @@ A search box on the Photos page. Results are ranked by similarity and can be com
 ("birthday cake" + person Alice + 2019). Because score ranges differ by model, the UI shows "best matches first" with
 a cut-off you can adjust, rather than a fixed threshold.
 
+## Phase 7.5: run the tasks from the web interface (built 2026-11-16)
+
+Until now the web interface could only work with what was already in the index; adding photos, finding faces and
+storing search vectors needed the menu or the command line. The **Tasks** page closes that gap.
+
+- **Same commands, run in the background.** `ui_tasks.py` starts `sort_photos.py sort / refresh / faces / cluster /
+  clipcheck / embed` as separate processes with `--db` set to the index the interface uses, and keeps their newest
+  4,000 output lines for the page, which polls for new lines every 0.8 s. Running the real commands (not calling them
+  inside the server) means one code path, the server stays responsive, and a crash in a model can't take it down.
+- **One task at a time,** because they all write to the index. "Place new faces" refuses to run while a task does,
+  and the other way round. After each task, cached people data is refreshed.
+- **Stop = Ctrl+C.** On Windows each task gets its own process group and receives Ctrl+Break, which `sort_photos.py`
+  now treats like Ctrl+C; elsewhere it gets SIGINT. Every command already saved its progress on Ctrl+C except `sort`,
+  which now stops after the current photo, prints its summary and exits with 130, and never leaves a half-copied file
+  behind (a copy cut short is deleted; with `--move` the original is only deleted after the copy is checked). If a
+  command doesn't stop within 20 s it is ended.
+- **Folder browser** lists subfolders (hidden and system folders left out) with shortcuts to Home, Pictures, the
+  remembered library and source, and every drive letter (read without touching disconnected network drives). A path
+  can always be typed or pasted, quotes from Explorer's "Copy as path" are removed, and relative paths are refused.
+- **Same flow as the menu:** sorting is preview first, then apply; faces is refresh, scan, group (a step with some
+  problems doesn't stop the next one, a failure does); search downloads the model only after a confirmation that
+  shows its size. Folders and the search model are remembered in `.photo-sorter.conf`, shared with the menu.
+- **Starting fresh:** `ui` no longer refuses to start without an index. It creates an empty one and opens on Tasks.
+
+Not done: installing missing Python packages from the page (it shows the `pip` command instead), and making a new
+folder inside the folder browser (type the path; sorting creates it).
+
 ## Phase 8: captions from a vision-language model (optional)
 
 A vision-language model writes a sentence per photo, stored as an annotation and searchable by keyword. This is slower
@@ -213,7 +241,8 @@ produce tags by comparing each photo with a list of words, which avoids another 
 2. Phase 6 (done): small, and unblocks everything else.
 3. Phase 7 (done) with ONNX CLIP-family models: biggest payoff. What is left is choosing between DFN-2B and SigLIP 2
    by trying both on a few hundred of your photos (both can be stored side by side).
-4. Phase 8 only if wanted.
+4. Phase 7.5 (done): the whole workflow from the web interface.
+5. Phase 8 only if wanted.
 
 ## Sources
 
