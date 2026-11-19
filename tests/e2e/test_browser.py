@@ -1,4 +1,6 @@
 """End-to-end checks of the web interface in a real browser."""
+import json
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -253,6 +255,8 @@ def test_tasks_page_chooses_folders_previews_then_sorts(page, site, tmp_path):
     for i in range(2):
         make_photo(incoming / f"new{i}.jpg", seed=500 + i, taken=f"2019:07:0{i + 1} 09:00:00")
     before = len(files(site))
+    urllib.request.urlopen(urllib.request.Request(f"{site.url}/api/library/root", data=json.dumps({"path": str(site.library)}).encode(),
+                                                  headers={"Content-Type": "application/json", "X-Photo-Sorter": "1"})).read()
     page.goto(f"{site.url}/#/tasks")
     page.get_by_role("heading", name="Sort new photos").wait_for()
 
@@ -265,10 +269,33 @@ def test_tasks_page_chooses_folders_previews_then_sorts(page, site, tmp_path):
     picker.get_by_role("button", name="Choose this folder").click()
     assert page.get_by_label("New photos", exact=True).input_value() == str(incoming)
 
-    page.get_by_label("Library", exact=True).first.fill(str(site.library))
-    page.get_by_role("button", name="Preview").first.click()
+    page.locator(".sort-card").get_by_role("button", name="Preview").click()
     page.get_by_role("button", name="Copy these photos").click()     # offered once the preview has finished
     page.get_by_role("button", name="Find faces in them").wait_for(timeout=60000)
     assert "Photos sorted:" in page.locator("pre.log").inner_text()
     assert len(files(site)) == before + 2 and (site.library / "2019" / "07-jul" / "new0.jpg").exists()
     assert len(list(incoming.iterdir())) == 2                        # copied, the originals stay
+
+
+def test_change_the_photo_library_then_add_it(page, site, tmp_path):
+    from conftest import make_photo
+    other = tmp_path / "Old photos"
+    for i in range(3):
+        make_photo(other / "2015" / "08-aug" / f"old{i}.jpg", seed=700 + i, taken=f"2015:08:0{i + 1} 12:00:00")
+    page.goto(f"{site.url}/#/tasks")
+    card = page.locator(".library-card")
+    card.get_by_role("button", name="Choose…").click()
+    picker = page.locator("dialog")
+    picker.get_by_label("Folder path").fill(str(tmp_path))
+    picker.get_by_role("button", name="Go").click()
+    picker.get_by_role("listitem").filter(has_text="Old photos").click()
+    page.wait_for_function("document.querySelector('dialog input').value.endsWith('Old photos')")
+    picker.get_by_role("button", name="Choose this folder").click()
+    page.wait_for_function(f"document.querySelector('.library-card .lib-path').textContent === {json.dumps(str(other))}")
+    card = page.locator(".library-card")
+    card.get_by_label("Find faces and group people").uncheck()
+    card.get_by_label("Prepare search", exact=False).uncheck()
+    card.get_by_role("button", name="Add this library").click()
+    page.get_by_role("link", name="See the photos").wait_for(timeout=60000)
+    assert "Added to index:" in page.locator("pre.log").inner_text()
+    page.wait_for_function("document.querySelector('.library-card .lib-stats b')?.textContent === '3'")

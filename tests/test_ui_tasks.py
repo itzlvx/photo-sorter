@@ -1,5 +1,7 @@
 """Phase 7.5: the Tasks page API — the folder browser, and running sort / faces / search as background jobs."""
 import json
+import shutil
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -312,3 +314,113 @@ def test_task_changes_need_the_custom_header(fake):
     assert fake.client.post("/api/tasks/group", json={}).status_code == 403
     assert fake.client.post("/api/jobs/current/stop", json={}).status_code == 403
     assert fake.calls() == []
+
+
+# --------------------------------------------------------------------------- the photo library (root folder)
+def sorted_library(root, seeds, year=2018):
+    for i, seed in enumerate(seeds):
+        make_photo(root / str(year) / "06-jun" / f"s{seed}.jpg", seed=seed, taken=f"{year}:06:{i + 1:02d} 10:00:00")
+    return root
+
+
+def test_no_library_yet_then_choosing_one(real, env, tmp_path):
+    status = real.client.get("/api/library/root").json()
+    assert status["root"] == "" and not status["exists"] and status["photos"] == 0
+    assert real.post("/api/library/root", {"path": "relative"}).status_code == 400
+    later = tmp_path / "not-there-yet"
+    status = real.post("/api/library/root", {"path": str(later)}).json()   # a new library that sorting will create
+    assert status["root"] == str(later) and not status["exists"]
+    assert ui_tasks.conf_get("LIBRARY_DIR") == str(later)
+    r = real.post("/api/tasks/library", {})
+    assert r.status_code == 400 and "does not exist" in r.json()["detail"]
+    assert real.client.get("/api/tasks").json()["library"]["root"] == str(later)
+
+
+def test_adding_an_already_sorted_library_indexes_it_after_a_preview(real, env):
+    sorted_library(env.dest, [1, 2, 3])
+    real.post("/api/library/root", {"path": str(env.dest)})
+    r = real.post("/api/tasks/library", {"apply": False})
+    assert r.status_code == 200 and r.json()["title"].startswith("Preview")
+    job = real.wait()
+    assert job["state"] == "finished" and "Would add:" in "\n".join(job["lines"])
+    assert scalar(env.db, "SELECT COUNT(*) FROM photos") == 0
+
+    real.post("/api/tasks/library", {"faces": False, "search": False})
+    job = real.wait()
+    assert job["state"] == "finished" and [s["label"] for s in job["steps"]] == ["Add the photos to the index"]
+    status = real.client.get("/api/library/root").json()
+    assert status["photos"] == 3 and status["outside"] == 0 and status["scanned"] == 0 and status["exists"]
+    assert real.client.get("/api/summary").json()["photos"] == 3
+
+
+def test_switching_to_another_library_keeps_the_old_photos_and_takes_over_copies(real, env, tmp_path):
+    sorted_library(env.dest, [1, 2])
+    real.post("/api/library/root", {"path": str(env.dest)})
+    real.post("/api/tasks/library", {"faces": False, "search": False})
+    real.wait()
+    with sqlite3.connect(env.db) as conn:
+        old_ids = [r for r, in conn.execute("SELECT id FROM photos")]
+
+    other = tmp_path / "other-drive"
+    sorted_library(other, [7, 8, 9], year=2021)
+    shutil.copy2(env.dest / "2018" / "06-jun" / "s1.jpg", other / "2021" / "06-jun" / "s1.jpg")   # one photo in both
+    status = real.post("/api/library/root", {"path": str(other)}).json()
+    assert status["photos"] == 0 and status["outside"] == 2              # nothing changes until it is added
+    real.post("/api/tasks/library", {"faces": False, "search": False})
+    job = real.wait()
+    assert job["state"] == "finished"
+    status = real.client.get("/api/library/root").json()
+    assert status["photos"] == 4 and status["outside"] == 1             # s1 now lives in the new library
+    assert scalar(env.db, "SELECT COUNT(*) FROM photos") == 5            # the old library's other photo stays
+    assert scalar(env.db, "SELECT id FROM photos WHERE sorted_path LIKE '%other-drive%s1.jpg'") in old_ids
+    assert len(tree(env.dest)) == 2                                      # files of the old library are untouched
+
+
+def test_the_library_task_runs_index_faces_grouping_and_search(fake, env):
+    clip_search = pytest.importorskip("clip_search")
+    from clip_fakes import make_model
+    make_model(clip_search.default_model_root() / "test-model")
+    env.dest.mkdir()
+    fake.post("/api/library/root", {"path": str(env.dest)})
+    r = fake.post("/api/tasks/library", {"model": "test-model", "hardware": "gpu"})
+    assert r.status_code == 200
+    job = fake.wait()
+    db = ["--db", str(env.db)]
+    assert fake.calls() == [["refresh", str(env.dest), "--apply", "--adopt", *db], ["faces", "--apply", "--gpu", *db],
+                            ["cluster", "--apply", *db], ["embed", "--apply", "--model", "test-model", *db]]
+    assert job["state"] == "finished" and job["params"]["model"] == "test-model"
+    assert ui_tasks.conf_get("SEARCH_MODEL") == "test-model"
+
+
+def test_library_task_options_and_failures(fake, env, monkeypatch):
+    pytest.importorskip("clip_search")
+    env.dest.mkdir()
+    fake.post("/api/library/root", {"path": str(env.dest)})
+    r = fake.post("/api/tasks/library", {"faces": False, "model": "ViT-B-32__openai"})
+    assert r.status_code == 409 and "not downloaded" in r.json()["detail"]      # a download needs a yes first
+    fake.post("/api/tasks/library", {"faces": False, "model": "ViT-B-32__openai", "download": True})
+    fake.wait()
+    assert [c[0] for c in fake.calls()] == ["refresh", "clipcheck", "embed"]
+
+    monkeypatch.setenv("FAKE_RC_cluster", "2")      # e.g. no faces at all: search is still prepared
+    fake.post("/api/tasks/library", {"model": "ViT-B-32__openai", "download": True})
+    job = fake.wait()
+    assert [s["state"] for s in job["steps"]][-3:] == ["failed", "ok", "ok"] and job["state"] == "failed"
+
+    monkeypatch.setenv("FAKE_RC_refresh", "2")      # the index could not be updated: nothing else runs
+    fake.post("/api/tasks/library", {"search": False})
+    job = fake.wait()
+    assert [s["state"] for s in job["steps"]] == ["failed", "skipped", "skipped"]
+
+
+def test_the_library_cannot_change_while_a_task_runs(fake, env, monkeypatch):
+    monkeypatch.setenv("FAKE_WAIT", "cluster")
+    fake.post("/api/tasks/group")
+    end = time.monotonic() + 30
+    while "fake cluster running" not in fake.client.get("/api/jobs/current").json()["job"]["lines"]:
+        assert time.monotonic() < end
+        time.sleep(0.05)
+    r = fake.post("/api/library/root", {"path": str(env.tmp)})
+    assert r.status_code == 409 and "still running" in r.json()["detail"]
+    fake.post("/api/jobs/current/stop")
+    assert fake.wait()["state"] == "stopped"

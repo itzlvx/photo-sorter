@@ -185,3 +185,36 @@ def test_upgrade_from_an_old_index_without_mtime(env, cli, library):
     r = cli("refresh", library, "--apply")
     assert r.code == 0 and "Upgrading the index" in r.out
     assert scalar(env.db, "SELECT COUNT(*) FROM photos") == 3
+
+
+# --------------------------------------------------------------------------- --adopt: switching to another library
+def test_adopt_points_photos_at_a_copied_library_and_keeps_their_faces(env, cli, library):
+    cli("refresh", library, "--apply")
+    ids = {name: scalar(env.db, "SELECT id FROM photos WHERE sorted_path LIKE ?", f"%{name}") for name in ("a.jpg", "b.jpg", "c.jpg")}
+    copy = env.tmp / "new-drive" / "Photos"
+    shutil.copytree(library, copy)
+    make_photo(copy / "2020" / "01-jan" / "d.jpg", 9, taken=datetime(2020, 1, 2))
+
+    plain = cli("refresh", copy, "--apply")                       # without --adopt the copies are extra copies
+    assert stat(plain.out, "Duplicate files:") == 3 and stat(plain.out, "Added to index:") == 1
+
+    preview = cli("refresh", copy, "--adopt")
+    assert stat(preview.out, "Would take over:") == 3 and "ADOPT" in preview.out
+    r = cli("refresh", copy, "--apply", "--adopt")
+    assert r.code == 0 and stat(r.out, "Taken over from elsewhere:") == 3 and stat(r.out, "Duplicate files:") == 0
+    for name, photo_id in ids.items():                             # same rows (so faces, names, notes stay), new place
+        path = scalar(env.db, "SELECT sorted_path FROM photos WHERE id = ?", photo_id)
+        assert path.startswith(str(copy)) and path.endswith(name)
+    assert scalar(env.db, "SELECT COUNT(*) FROM photos") == 4
+    assert len(tree(library)) == 3                                 # the old library is not touched
+
+    again = cli("refresh", copy, "--apply", "--adopt")             # nothing left to take over
+    assert stat(again.out, "Taken over from elsewhere:") == 0 and stat(again.out, "Unchanged (not re-hashed):") == 4
+
+
+def test_adopt_leaves_extra_copies_inside_the_same_library_alone(env, cli, library):
+    cli("refresh", library, "--apply")
+    shutil.copy2(library / "2019" / "03-mar" / "a.jpg", library / "2019" / "03-mar" / "a copy.jpg")
+    r = cli("refresh", library, "--apply", "--adopt")
+    assert stat(r.out, "Taken over from elsewhere:") == 0 and stat(r.out, "Duplicate files:") == 1
+    assert paths(env.db) == ["a.jpg", "b.jpg", "c.jpg"]

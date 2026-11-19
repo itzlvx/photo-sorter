@@ -41,6 +41,18 @@ def test_index_without_faces(env, cli):
     assert r.code == 2 and "No faces are stored yet" in r.err
 
 
+def test_scanned_photos_without_any_faces_is_not_an_error(env, cli):
+    env.db.parent.mkdir(parents=True)
+    conn = sp.open_index(env.db)
+    conn.execute("INSERT INTO photos (sha256, original_path, sorted_path, taken_at, date_source, size_bytes, sorted_at)"
+                 " VALUES ('x', 'a.jpg', 'a.jpg', '2020-01-01T00:00:00', 'exif_original', 1, '2020-01-01T00:00:00')")
+    conn.execute("INSERT INTO face_scans (photo_id, scanned_at, model, face_count) VALUES (1, '2020-01-01', 'buffalo_l', 0)")
+    conn.commit()
+    conn.close()
+    r = cli("cluster", "--apply")
+    assert r.code == 0 and "nothing to group" in r.out
+
+
 @pytest.mark.parametrize("flags, message", [
     (["--threshold", "0.3", "--review-threshold", "0.5"], "Thresholds must satisfy"),
     (["--threshold", "1.0"], "Thresholds must satisfy"),

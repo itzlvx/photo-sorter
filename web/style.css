@@ -369,3 +369,16 @@ pre.log { margin: 0; height: 300px; max-height: 50vh; overflow: auto; font: 12.5
 @media (max-width: 820px) {
   .tasks { grid-template-columns: minmax(0, 1fr); }
 }
+
+/* tasks: the photo library card */
+.library-card { margin-bottom: 18px; }
+.lib-head { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px 16px; }
+.lib-head > div { min-width: 0; }
+.lib-path { margin: 4px 0 0; font: 14px/1.4 ui-monospace, "Cascadia Mono", Consolas, monospace; overflow-wrap: anywhere; color: var(--ink); }
+.task-field .lib-path { margin: 0; }
+.lib-stats { margin: 0; display: flex; flex-wrap: wrap; gap: 4px 22px; color: var(--mute); }
+.lib-stats b { color: var(--ink); font-size: 18px; font-variant-numeric: tabular-nums; }
+.lib-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; }
+.tick-row { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+.tick-row input { width: 17px; height: 17px; accent-color: var(--blue); margin: 0; }
+.tick-row:has(input:disabled) { color: var(--mute); cursor: default; }

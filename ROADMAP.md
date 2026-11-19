@@ -212,9 +212,19 @@ storing search vectors needed the menu or the command line. The **Tasks** page c
   problems doesn't stop the next one, a failure does); search downloads the model only after a confirmation that
   shows its size. Folders and the search model are remembered in `.photo-sorter.conf`, shared with the menu.
 - **Starting fresh:** `ui` no longer refuses to start without an index. It creates an empty one and opens on Tasks.
+- **The photo library as a setting** (added 2026-11-18). The library folder (`LIBRARY_DIR`, shared with the menu) is
+  shown at the top of the Tasks page with how many of its photos are indexed, face-scanned and searchable; sorting and
+  face scanning use it. **Add this library** runs `refresh --apply --adopt`, `faces`, `cluster` and `embed` in one job.
+  Faces and search don't depend on each other, so a problem in one doesn't stop the other; a failed index update
+  stops everything. `refresh --adopt` is new: a photo the index has in a folder outside this library (an earlier
+  library, still on disk) is re-pointed to its copy here, keeping its row and so its faces, names, notes and vectors.
+  Without `--adopt` such copies are still reported as extra copies and left alone. Photos only in the old library stay
+  in the index, counted on the card. `cluster` now exits 0 with "nothing to group" when photos were scanned and none had
+  a face (it still exits 2 when nothing was scanned yet).
 
-Not done: installing missing Python packages from the page (it shows the `pip` command instead), and making a new
-folder inside the folder browser (type the path; sorting creates it).
+Not done: installing missing Python packages from the page (it shows the `pip` command instead), making a new folder
+inside the folder browser (type the path; sorting creates it), and removing an old library's photos from the index
+(they stay, counted on the library card; a "forget photos outside the library" button would be the follow-up).
 
 ## Phase 8: captions from a vision-language model (optional)
 

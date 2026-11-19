@@ -357,14 +357,26 @@ stays free for face scanning and `embed`.
 Everything the menu does for new photos can now be done from the web interface. Open **Tasks** in the left column
 (it opens there by itself while the index is still empty, so you can start with `python sort_photos.py ui` alone).
 
-- **Sort new photos.** Choose the folder with the new photos and your library, either by typing or pasting a path or
-  with **Browse…**, which lists the folders on this computer (with shortcuts to Home, Pictures, your library and every
-  drive). The library folder doesn't have to exist yet. Choose **Copy** (originals stay) or **Move** (each original is
-  deleted only after its copy is checked), then **Preview**. Nothing changes until you press **Copy these photos** /
-  **Move these photos** under the preview.
-- **Find faces and group people.** Refreshes the index from the library, scans the photos that haven't been scanned,
-  then groups the faces, the same three steps as menu option 3. Optionally limit how many photos are scanned (for a
-  quick test) and choose GPU or CPU. **Group faces only** runs just the last step.
+- **Photo library** (at the top). The folder your sorted photos live in. It shows how many of its photos are in the
+  index, scanned for faces and searchable. **Change…** (or **Choose…** the first time) picks another folder with the
+  folder browser; a folder that doesn't exist yet is fine if you are about to sort photos into it. Then **Add this
+  library** brings everything up to date in one go: it adds the photos already in that folder to the index (with
+  their camera details), finds the faces, groups them and stores search vectors. Untick **Find faces and group people**
+  or **Prepare search** to leave those out; **Preview** shows what would be added without changing anything. Run it
+  again whenever photos were added, moved or deleted outside this program; anything already done is skipped.
+  - If the new folder holds photos the index already knows from the old folder (for example a copy of your library on
+    a new drive), those photos are moved over to the new folder in the index and keep their faces, names, notes and
+    search vectors. Nothing is copied or deleted on disk.
+  - Photos of the old library that aren't in the new one stay in the index and on the Photos page, and the card says
+    how many there are. Changing the library never removes anything.
+- **Sort new photos.** Choose the folder with the new photos, either by typing or pasting a path or with **Browse…**,
+  which lists the folders on this computer (with shortcuts to Home, Pictures, your library and every drive). They go
+  into the photo library. Choose **Copy** (originals stay) or **Move** (each original is deleted only after its copy is
+  checked), then **Preview**. Nothing changes until you press **Copy these photos** / **Move these photos** under the
+  preview.
+- **Find faces and group people.** Refreshes the index from the photo library, scans the photos that haven't been
+  scanned, then groups the faces, the same three steps as menu option 3. Optionally limit how many photos are scanned
+  (for a quick test) and choose GPU or CPU. **Group faces only** runs just the last step.
 - **Prepare search.** Choose a search model (the list says which are downloaded and how big the others are), then
   **Preview** or **Process photos**. A model that isn't downloaded yet is fetched once after you agree, then checked.
 
@@ -374,8 +386,9 @@ work so far is kept, and running the task again continues where it stopped. Only
 all write to the same index. When a task finishes, the page offers the obvious next step (for example **Find faces in
 them** after sorting, **Name the people** after grouping).
 
-Each task runs the same `sort_photos.py` command you would type, against the index the interface is using, and the
-folders and search model you choose are remembered in `.photo-sorter.conf` (shared with the menu). Missing Python
+Each task runs the same `sort_photos.py` command you would type, against the index the interface is using (adding a
+library is `refresh LIBRARY --apply --adopt`, then `faces`, `cluster` and `embed`), and the library, folders and search
+model you choose are remembered in `.photo-sorter.conf` (shared with the menu). Missing Python
 packages are pointed out on the page, with the `pip install` command to run. Stopping the web interface also stops a
 task that is still running.
 

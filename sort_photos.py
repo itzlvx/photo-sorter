@@ -788,6 +788,19 @@ def refresh(args: argparse.Namespace) -> int:
                         "UPDATE photos SET size_bytes=?, mtime_ns=? WHERE sha256=?",
                         (size, mtime, sha),
                     )
+            elif getattr(args, "adopt", False) and not _norm(known["path"]).startswith(root + os.sep):
+                # --adopt: the index has this photo in another folder (an earlier library); point it here, keeping its
+                # faces, names, notes and search vectors. The file in the other folder is not touched.
+                stats["adopted"] += 1
+                detail("ADOPT  %s  (was %s)", path, known["path"])
+                old_key = _norm(known["path"])
+                known.update(path=str(path), size=size, mtime=mtime)
+                by_path[key] = known
+                by_path.pop(old_key, None)
+                write(
+                    "UPDATE photos SET sorted_path=?, size_bytes=?, mtime_ns=? WHERE sha256=?",
+                    (str(path), size, mtime, sha),
+                )
             elif os.path.exists(known["path"]):
                 stats["duplicate_files"] += 1
                 detail("DUPLICATE  %s  (same content as %s)", path, known["path"])
@@ -885,6 +898,8 @@ def refresh(args: argparse.Namespace) -> int:
     log.info("%-28s%d", "Unchanged (not re-hashed):", stats["unchanged"])
     log.info("%-28s%d", "Added to index:" if args.apply else "Would add:", stats["added"])
     log.info("%-28s%d", "Moved/renamed:" if args.apply else "Would update (moved):", stats["moved"])
+    if getattr(args, "adopt", False):
+        log.info("%-28s%d", "Taken over from elsewhere:" if args.apply else "Would take over:", stats["adopted"])
     log.info("%-28s%d", "Timestamps refreshed:", stats["timestamps_updated"])
     log.info("%-28s%d (extra copies, left alone)", "Duplicate files:", stats["duplicate_files"])
     if args.apply:
@@ -1099,6 +1114,7 @@ def build_parser() -> argparse.ArgumentParser:
     refresh_cmd.add_argument("--keep-missing", action="store_true", help="do not remove index rows for photos that no longer exist on disk (they are removed by default)")
     refresh_cmd.add_argument("--force-prune", action="store_true", help="allow removing missing photos even when more than half of the library is missing")
     refresh_cmd.add_argument("--prune", action="store_true", help=argparse.SUPPRESS)  # old name, now the default behaviour
+    refresh_cmd.add_argument("--adopt", action="store_true", help="photos the index has in another folder (an earlier library) are pointed to their copy in this library, keeping their faces and names")
     refresh_cmd.add_argument("--rehash", action="store_true", help="re-hash every file instead of trusting size + modified time")
     refresh_cmd.add_argument("--no-metadata", action="store_true", help="do not read camera details for photos indexed before they were recorded")
 

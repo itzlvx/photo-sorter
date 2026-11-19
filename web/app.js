@@ -1095,6 +1095,7 @@ async function jobDone(data) {
   const [label] = JOB_STATES[data.state] || ["Done"];
   toast(`${data.title}: ${label.toLowerCase()}`, data.state === "failed" ? "error" : "");
   await refreshSummary().catch(() => {});
+  if (location.hash.startsWith("#/tasks")) viewTasks();   // fresh library counts
 }
 
 async function startTask(path, body) {
@@ -1134,6 +1135,13 @@ function jobNextActions(j) {
     else if (ok) out.push(h("button", { class: "btn primary", type: "button", text: "Process the photos", onclick: () => startSearch(p.model, true) }));
   }
   if (j.kind === "search" && j.apply && ok) out.push(h("a", { class: "btn primary", href: "#/photos", text: "Search your photos" }));
+  if (j.kind === "library" && !j.apply && ok && job.addLibrary) {
+    out.push(h("button", { class: "btn primary", type: "button", text: "Add this library", onclick: () => job.addLibrary() }));
+  }
+  if (j.kind === "library" && j.apply && ok) {
+    out.push(h("a", { class: "btn primary", href: "#/photos", text: "See the photos" }));
+    if (p.faces) out.push(h("a", { class: "btn", href: "#/people", text: "Name the people" }));
+  }
   if ((j.kind === "faces" || j.kind === "group") && ok) {
     out.push(h("a", { class: "btn primary", href: "#/people", text: "Name the people" }));
     if (state.summary && state.summary.review > 0) out.push(h("a", { class: "btn", href: "#/review", text: `Review ${plural(state.summary.review, "face")}` }));
@@ -1262,37 +1270,83 @@ async function viewTasks() {
   const busy = () => job.current && job.current.state === "running";
   const guard = (fn) => () => { if (busy()) toast("Another task is still running. Wait for it, or stop it first.", "error"); else fn(); };
 
-  // sort new photos
+  // the photo library: its root folder, and how much of it is indexed, scanned and searchable
+  const lib = info.library;
+  const root = lib.root;
+  const searchModel = info.search.models.find((m) => m.name === info.search.default);
+  const tick = (label, on, problem) => {
+    const box = h("input", { type: "checkbox", checked: on && !problem, disabled: !!problem });
+    const el = h("label", { class: "tick-row", title: problem || "" }, box, h("span", { text: label }));
+    el.get = () => box.checked;
+    return el;
+  };
+  const wantFaces = tick("Find faces and group people", true, info.packages.faces);
+  const wantSearch = tick(searchModel ? `Prepare search (${searchModel.name}${searchModel.downloaded ? "" : ", a " + searchModel.size + " download"})` : "Prepare search",
+    true, info.packages.search || (!searchModel && "No search model is available."));
+  const addLibrary = async (apply) => {
+    const body = { apply, faces: wantFaces.get(), search: wantSearch.get(), model: info.search.default, hardware: "auto" };
+    if (apply && body.search && searchModel && !searchModel.downloaded) {
+      if (!(await ask({ title: "Download the search model?", text: `${searchModel.name} is about ${searchModel.size}. It is downloaded once from Hugging Face (huggingface.co/immich-app) and kept on this computer.`, confirmLabel: "Download and go on" }))) return;
+      body.download = true;
+    }
+    startTask("/api/tasks/library", body);
+  };
+  job.addLibrary = () => { if (busy()) toast("Another task is still running.", "error"); else addLibrary(true); };
+  const changeRoot = () => openFolderPicker({ title: "Your photo library", start: root, onPick: async (path) => {
+    try {
+      await api("/api/library/root", { body: { path } });
+      toast("Library changed. Add it to index its photos.");
+      viewTasks();
+    } catch (e) { toast(e.message, "error"); }
+  } });
+  const facts = !root ? [h("p", { text: "No library chosen yet. Choose the folder that holds (or will hold) your sorted photos." })]
+    : !lib.exists ? [h("p", { text: "This folder doesn't exist yet. Sort photos into it below, or choose another folder." })]
+    : [h("p", { class: "lib-stats" },
+        h("span", {}, h("b", { text: lib.photos.toLocaleString() }), ` ${lib.photos === 1 ? "photo" : "photos"} in the index`),
+        h("span", {}, h("b", { text: lib.scanned.toLocaleString() }), " scanned for faces"),
+        h("span", {}, h("b", { text: lib.searchable.toLocaleString() }), " searchable")),
+      h("p", { class: "hint", text: "Add the library after choosing it, and again whenever photos were added, moved or deleted outside this program. Photos already in the index are skipped, and a photo that was moved keeps its faces and names." })];
+  const libraryCard = h("section", { class: "task-card library-card", "aria-labelledby": "t-lib" },
+    h("div", { class: "lib-head" },
+      h("div", {}, h("h2", { id: "t-lib", text: "Photo library" }), h("p", { class: "lib-path", text: root || "Not chosen" })),
+      h("span", { class: "spacer" }),
+      h("button", { class: "btn" + (root ? "" : " primary"), type: "button", text: root ? "Change…" : "Choose…", onclick: guard(changeRoot) })),
+    ...facts,
+    lib.outside ? h("p", { class: "hint", text: `${plural(lib.outside, "photo")} in the index ${lib.outside === 1 ? "is" : "are"} in other folders (an earlier library). They stay in the index and on the Photos page; nothing is removed when you change the library.` }) : null,
+    lib.exists ? h("div", { class: "lib-actions" }, wantFaces, wantSearch, h("span", { class: "spacer" }),
+      h("button", { class: "btn", type: "button", text: "Preview", title: "Show what would be added, without changing anything", onclick: guard(() => addLibrary(false)) }),
+      h("button", { class: "btn primary", type: "button", text: "Add this library", onclick: guard(() => addLibrary(true)) })) : null);
+
+  // sort new photos (into the library)
   const source = folderField("New photos", info.folders.source, "The folder with the photos to add. Folders inside it are included.", "Folder with the new photos");
-  const library = folderField("Library", info.folders.library, "Photos go into Year\\Month folders here, for example 2024\\03-mar.", "Your library folder");
   const how = segChoice("Copy or move", [["copy", "Copy"], ["move", "Move"]], "copy");
-  const sortCard = h("section", { class: "task-card", "aria-labelledby": "t-sort" },
+  const sortCard = h("section", { class: "task-card sort-card", "aria-labelledby": "t-sort" },
     h("h2", { id: "t-sort", text: "Sort new photos" }),
     h("p", { text: "Copies photos into your library by the date they were taken, and skips any that are already there. First a preview shows what would happen; nothing changes until you agree." }),
-    source, library, how,
+    source,
+    h("div", { class: "task-field" }, h("span", { class: "lbl", text: "Into the library" }), h("span", { class: "lib-path", text: root || "Choose the photo library above first." }),
+      h("span", { class: "hint", text: "In Year\\Month folders, for example 2024\\03-mar." })),
+    how,
     h("p", { class: "hint", text: "Copy keeps your originals where they are. Move deletes each original only after its copy is checked." }),
-    h("div", { class: "row" }, h("button", { class: "btn primary", type: "button", text: "Preview", onclick: guard(() =>
-      startTask("/api/tasks/sort", { source: source.input.value.trim(), library: library.input.value.trim(), move: how.get() === "move" })) })));
+    h("div", { class: "row" }, h("button", { class: "btn primary", type: "button", text: "Preview", disabled: !root, onclick: guard(() =>
+      startTask("/api/tasks/sort", { source: source.input.value.trim(), library: root, move: how.get() === "move" })) })));
 
   // faces
-  const facesLib = folderField("Library", info.folders.library, null, "Your library folder");
-  library.input.addEventListener("change", () => { if (!facesLib.input.value.trim()) facesLib.input.value = library.input.value; });
   const limit = h("input", { class: "field", type: "number", min: "1", step: "1", inputmode: "numeric", placeholder: "All new photos", "aria-label": "How many photos to scan" });
   const hardware = segChoice("Hardware", [["auto", "Automatic"], ["gpu", "GPU only"], ["cpu", "CPU only"]], "auto");
   const facesMissing = info.packages.faces;
   const facesCard = h("section", { class: "task-card", id: "t-faces-card", "aria-labelledby": "t-faces" },
     h("h2", { id: "t-faces", text: "Find faces and group people" }),
-    h("p", { text: "Updates the index from your library, finds the faces in photos not scanned yet, then groups them into people. Your photos are only read. It can be stopped and continued later." }),
+    h("p", { text: "Updates the index from the photo library, finds the faces in photos not scanned yet, then groups them into people. Your photos are only read. It can be stopped and continued later." }),
     facesMissing ? h("p", { class: "task-warn", text: facesMissing }) : null,
-    facesLib,
     h("label", { class: "task-field" }, h("span", { class: "lbl", text: "How many photos" }), limit, h("span", { class: "hint", text: "Leave empty for all new photos, or type a small number for a quick test." })),
     hardware,
     h("div", { class: "row" },
       h("button", { class: "btn", type: "button", text: "Group faces only", title: "Place faces that are already found, without scanning", onclick: guard(() => startTask("/api/tasks/group", {})) }),
-      h("button", { class: "btn primary", type: "button", text: "Start", disabled: !!facesMissing, onclick: guard(() => {
+      h("button", { class: "btn primary", type: "button", text: "Start", disabled: !!facesMissing || !lib.exists, onclick: guard(() => {
         const n = limit.value.trim();
         if (n && !(Number(n) >= 1)) { toast("How many photos must be a number, or empty for all.", "error"); return; }
-        startFaces(facesLib.input.value.trim(), { limit: n ? Math.floor(Number(n)) : null, hardware: hardware.get() });
+        startFaces(root, { limit: n ? Math.floor(Number(n)) : null, hardware: hardware.get() });
       }) })));
 
   // search vectors
@@ -1314,8 +1368,9 @@ async function viewTasks() {
       h("button", { class: "btn primary", type: "button", text: "Process photos", disabled: !!searchMissing || !models.length, onclick: guard(() => startSearch(select.value, true)) })));
 
   main.replaceChildren(
-    head("Tasks", "Bring new photos into your library, find the faces in them and prepare search. You can leave this page while a task runs."),
+    head("Tasks", "Choose your photo library, bring new photos into it, find the faces and prepare search. You can leave this page while a task runs."),
     h("section", { class: "job", id: "job-panel", "aria-live": "polite", hidden: true }),
+    libraryCard,
     h("div", { class: "tasks" }, sortCard, facesCard, searchCard),
   );
   renderJobPanel();

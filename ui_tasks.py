@@ -341,6 +341,49 @@ class SearchBody(BaseModel):
     download: bool = False
 
 
+class LibraryRootBody(BaseModel):
+    path: str
+
+
+class LibraryTaskBody(BaseModel):
+    apply: bool = True
+    faces: bool = True
+    search: bool = True
+    model: str = ""
+    download: bool = False
+    hardware: str = "auto"
+
+
+def library_status(db_path: Path, root: str, model: str) -> dict:
+    """How much of the library at `root` is indexed, scanned for faces and searchable (photos elsewhere are counted apart)."""
+    import sqlite3
+    import sort_photos as sp
+    status = {"root": root, "exists": bool(root) and Path(root).is_dir(), "photos": 0, "outside": 0,
+              "scanned": 0, "searchable": 0, "model": model}
+    if not db_path.exists():
+        return status
+    prefix = sp._norm(root) + os.sep if root else None
+    conn = sqlite3.connect(db_path, timeout=30)
+    try:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        scanned = "EXISTS (SELECT 1 FROM face_scans s WHERE s.photo_id = p.id AND s.error IS NULL)" if "face_scans" in tables else "0"
+        vectors = ("EXISTS (SELECT 1 FROM photo_embeddings e WHERE e.photo_id = p.id AND e.model = ?)"
+                   if "photo_embeddings" in tables and model else "0")
+        params = [model] if vectors != "0" else []
+        for path, has_scan, has_vector in conn.execute(f"SELECT p.sorted_path, {scanned}, {vectors} FROM photos p", params):
+            if prefix and sp._norm(path).startswith(prefix):
+                status["photos"] += 1
+                status["scanned"] += bool(has_scan)
+                status["searchable"] += bool(has_vector)
+            else:
+                status["outside"] += 1
+    except sqlite3.Error:
+        pass
+    finally:
+        conn.close()
+    return status
+
+
 def package_problem(*modules: str) -> str | None:
     import importlib.util
     missing = [m for m in modules if importlib.util.find_spec(m) is None]
@@ -395,6 +438,7 @@ def add_task_routes(app: FastAPI, db_path: Path, runner: JobRunner, model_root: 
                           "Install them with: pip install -r requirements-search.txt" if search else None,
             },
             "search": {"models": models, "default": default},
+            "library": library_status(db_path, conf_get("LIBRARY_DIR"), default),
             "job": runner.job.json() if runner.job else None,
         }
 
@@ -447,28 +491,81 @@ def add_task_routes(app: FastAPI, db_path: Path, runner: JobRunner, model_root: 
     def group_task():
         return start("group", "Grouping faces into people", [Step("Group faces into people", ["cluster", "--apply", *db_args])], {}, True)
 
-    @app.post("/api/tasks/search")
-    def search_task(body: SearchBody):
+    def search_steps(model: str, download: bool) -> tuple[list[Step], bool]:
+        """The steps that store search vectors with `model`, downloading it first when it is missing and that was agreed."""
         try:
             import clip_search
         except ImportError as error:
             raise HTTPException(409, f"Search needs extra packages ({error}). Install them with: pip install -r requirements-search.txt")
-        model = body.model.strip()
         try:
             downloaded = not clip_search.missing_files(clip_search.model_folder(model_root, model))
         except clip_search.ModelError as error:
             raise HTTPException(400, str(error))
-        params = {"model": model, "downloaded": downloaded}
-        if not body.apply:
-            steps = [Step("Preview", ["embed", "--model", model, *root_args, *db_args])]
-            return start("search", "Preview: prepare search", steps, params, False)
         steps = []
         if not downloaded:
-            if not body.download:
+            if not download:
                 raise HTTPException(409, f"The search model {model} is not downloaded yet (about {clip_search.size_hint(model)}).")
             steps.append(Step("Download and check the model",
                               ["clipcheck", "--model", model, "--download", "--no-cpu-compare", *root_args, *db_args],
                               stop_on=lambda rc: rc != 0))
         steps.append(Step("Store search vectors", ["embed", "--apply", "--model", model, *root_args, *db_args]))
+        return steps, downloaded
+
+    @app.post("/api/tasks/search")
+    def search_task(body: SearchBody):
+        model = body.model.strip()
+        if not body.apply:
+            try:
+                import clip_search
+                downloaded = not clip_search.missing_files(clip_search.model_folder(model_root, model))
+            except ImportError as error:
+                raise HTTPException(409, f"Search needs extra packages ({error}). Install them with: pip install -r requirements-search.txt")
+            except clip_search.ModelError as error:
+                raise HTTPException(400, str(error))
+            steps = [Step("Preview", ["embed", "--model", model, *root_args, *db_args])]
+            return start("search", "Preview: prepare search", steps, {"model": model, "downloaded": downloaded}, False)
+        steps, downloaded = search_steps(model, body.download)
         conf_set("SEARCH_MODEL", model)
-        return start("search", "Preparing search", steps, params, True)
+        return start("search", "Preparing search", steps, {"model": model, "downloaded": downloaded}, True)
+
+    # ------------------------------------------------------------ the photo library (its root folder)
+    def default_search_model() -> str:
+        try:
+            import clip_search
+        except ImportError:
+            return conf_get("SEARCH_MODEL")
+        return conf_get("SEARCH_MODEL") or clip_search.DEFAULT_MODEL
+
+    @app.get("/api/library/root")
+    def library_root():
+        return library_status(db_path, conf_get("LIBRARY_DIR"), default_search_model())
+
+    @app.post("/api/library/root")
+    def set_library_root(body: LibraryRootBody):
+        """Change the photo library folder. Nothing is indexed or removed until the library task runs."""
+        if runner.busy():
+            raise HTTPException(409, f"'{runner.job.title}' is still running. Change the library when it has finished.")
+        root = absolute_folder(body.path, "library folder", False)
+        conf_set("LIBRARY_DIR", str(root))
+        return library_status(db_path, str(root), default_search_model())
+
+    @app.post("/api/tasks/library")
+    def library_task(body: LibraryTaskBody):
+        """Bring the index in line with the library: add (and re-point) photos, then find faces, group, store search vectors."""
+        root = absolute_folder(conf_get("LIBRARY_DIR"), "library folder", True)
+        if not body.apply:
+            steps = [Step("Preview", ["refresh", str(root), "--adopt", *db_args])]
+            return start("library", "Preview: add this library", steps, {"library": str(root)}, False)
+        steps = [Step("Add the photos to the index", ["refresh", str(root), "--apply", "--adopt", *db_args])]
+        if body.faces:
+            hardware = {"gpu": ["--gpu"], "cpu": ["--cpu"]}.get(body.hardware, [])
+            # faces and search don't depend on each other: a problem with one doesn't stop the other
+            steps += [Step("Find faces", ["faces", "--apply", *hardware, *db_args], stop_on=lambda rc: False),
+                      Step("Group faces into people", ["cluster", "--apply", *db_args], stop_on=lambda rc: False)]
+        model = ""
+        if body.search:
+            model = body.model.strip() or default_search_model()
+            steps += search_steps(model, body.download)[0]
+            conf_set("SEARCH_MODEL", model)
+        params = {"library": str(root), "faces": body.faces, "search": body.search, "model": model}
+        return start("library", "Adding the library", steps, params, True)

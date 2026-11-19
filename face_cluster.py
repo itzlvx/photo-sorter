@@ -504,6 +504,10 @@ def cluster_faces(args) -> int:
             return 2
         model = choose_model(conn, args.model)
         if model is None:
+            scanned = has_table(conn, "face_scans") and conn.execute("SELECT 1 FROM face_scans WHERE error IS NULL LIMIT 1").fetchone()
+            if scanned:  # photos were scanned and none had a face (landscapes, documents...): a normal outcome
+                log.info("No faces were found in the scanned photos, so there is nothing to group.")
+                return 0
             log.error("No faces are stored yet. Run 'faces --apply' first.")
             return 2
         data = load_faces(conn, model, args)
