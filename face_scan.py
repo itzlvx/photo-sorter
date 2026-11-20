@@ -92,23 +92,23 @@ class FaceEngine:
             problem = preload_cuda_libraries()
             if problem:
                 log.warning("Could not preload the CUDA libraries: %s", problem)
-        self.app = FaceAnalysis(
-            name=model,
-            root=str(model_root_path(model_root)),
-            # No age/gender module: not needed and not wanted.
-            allowed_modules=["detection", "recognition", "landmark_3d_68"],
-            providers=providers,
-        )
-        # ctx_id < 0 forces the CPU inside InsightFace, so use 0 whenever a GPU provider is chosen.
-        self.app.prepare(ctx_id=0 if wants_gpu else -1, det_thresh=min_score, det_size=(det_size, det_size))
+        self._load(FaceAnalysis, model, model_root, det_size, min_score, providers, wants_gpu)
 
-        self.session_providers = {
-            name: m.session.get_providers() for name, m in self.app.models.items() if hasattr(m, "session")
-        }
-        used = {p[0] for p in self.session_providers.values() if p}
-        self.provider = used.pop() if len(used) == 1 else "mixed"
-        for name, active in self.session_providers.items():
-            log.debug("Model part %s runs on %s", name, active[0] if active else "?")
+        if wants_gpu and self.provider == self.requested:
+            # Loading can succeed on a GPU that then fails on the first photo (for example a cuDNN
+            # too new for an older card), so prove it with a real test run before trusting it.
+            failure = self._self_test()
+            if failure:
+                if mode == "gpu":
+                    raise RuntimeError(f"The NVIDIA GPU loaded the models but failed to run them ({failure}). {GPU_TROUBLE}")
+                log.warning(
+                    "%s loaded but failed a test run (%s), so this runs on the CPU instead. "
+                    "Run 'python sort_photos.py gpucheck' to find out why.",
+                    PROVIDER_LABELS.get(self.requested, self.requested), failure,
+                )
+                self._load(FaceAnalysis, model, model_root, det_size, min_score, ["CPUExecutionProvider"], False)
+                return
+
         if wants_gpu and self.provider != self.requested:
             detail = ", ".join(f"{n}: {p[0] if p else '?'}" for n, p in self.session_providers.items())
             if mode == "gpu":
@@ -121,6 +121,34 @@ class FaceEngine:
                 "Run 'python sort_photos.py gpucheck' to find out why.",
                 PROVIDER_LABELS.get(self.requested, self.requested), detail,
             )
+
+    def _load(self, face_analysis, model, model_root, det_size, min_score, providers, wants_gpu) -> None:
+        self.app = face_analysis(
+            name=model,
+            root=str(model_root_path(model_root)),
+            # No age/gender module: not needed and not wanted.
+            allowed_modules=["detection", "recognition", "landmark_3d_68"],
+            providers=providers,
+        )
+        # ctx_id < 0 forces the CPU inside InsightFace, so use 0 whenever a GPU provider is chosen.
+        self.app.prepare(ctx_id=0 if wants_gpu else -1, det_thresh=min_score, det_size=(det_size, det_size))
+        self.session_providers = {
+            name: m.session.get_providers() for name, m in self.app.models.items() if hasattr(m, "session")
+        }
+        used = {p[0] for p in self.session_providers.values() if p}
+        self.provider = used.pop() if len(used) == 1 else "mixed"
+        for name, active in self.session_providers.items():
+            log.debug("Model part %s runs on %s", name, active[0] if active else "?")
+
+    def _self_test(self) -> str | None:
+        """Run every model part once on InsightFace's sample photo (it has faces, so all parts run)."""
+        try:
+            from insightface.data import get_image
+
+            self.app.get(get_image("t1"))
+        except Exception as error:
+            return f"{type(error).__name__}: {str(error).splitlines()[0][:300]}"
+        return None
 
     def detect(self, bgr: np.ndarray) -> list[dict]:
         found = []

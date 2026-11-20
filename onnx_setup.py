@@ -20,7 +20,9 @@ GPU_TROUBLE = (
     "Common causes: an out-of-date NVIDIA driver; the CUDA/cuDNN libraries missing (install the GPU build "
     'with the extras: pip install "onnxruntime-gpu[cuda,cudnn]"); or a GPU too old for this build. '
     "The current onnxruntime-gpu targets CUDA 13, which needs a recent driver and a GTX 16-series/RTX 20-series "
-    'or newer GPU. For an older GPU try the CUDA 12 build: pip install "onnxruntime-gpu[cuda,cudnn]==1.26.0".'
+    'or newer GPU. For an older GPU try the CUDA 12 build: pip install "onnxruntime-gpu[cuda,cudnn]==1.26.0". '
+    "A GTX 10-series (Pascal) or older card also needs a cuDNN older than 9.9: "
+    'pip install "nvidia-cudnn-cu12<9.9".'
 )
 PROVIDER_LABELS = {
     "CUDAExecutionProvider": "NVIDIA GPU (CUDA)",
