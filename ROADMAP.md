@@ -222,6 +222,16 @@ storing search vectors needed the menu or the command line. The **Tasks** page c
   in the index, counted on the card. `cluster` now exits 0 with "nothing to group" when photos were scanned and none had
   a face (it still exits 2 when nothing was scanned yet).
 
+- **Signing in** (added 2026-11-19). The web interface can now be opened from other computers (`photo-sorter.bat`
+  starts it with `--host 0.0.0.0`), so it needs a password. One user, `admin`; the first visit chooses the password
+  (only while none is set, so it can't be taken over later). `web_auth.py` (standard library only) keeps a salted
+  PBKDF2-SHA256 hash in a `web_login` table of the index and signs 30-day session cookies (HttpOnly, SameSite=Strict)
+  with a secret that changes with every password, so a reset signs every browser out at once. Every page and API
+  request needs a valid session except the sign-in page, its three API calls and the static files under `/web/`
+  (program code, no data). Ten wrong passwords from one address within ten minutes make sign-in wait. The new
+  `password` command (menu option 7) sets a new password; `password --clear` lets the page ask again. Not done: more
+  than one user, and HTTPS (it is meant for a home network only).
+
 Not done: installing missing Python packages from the page (it shows the `pip` command instead), making a new folder
 inside the folder browser (type the path; sorting creates it), and removing an old library's photos from the index
 (they stay, counted on the library card; a "forget photos outside the library" button would be the follow-up).

@@ -18,8 +18,10 @@ What you can do in the interface
 Choices you make here are protected from the AI: confirmed faces, named people,
 merged people and ignored faces are never moved by 'cluster', even with --recluster.
 
-Because face data is biometric, the server only answers requests for localhost,
-and every change must carry a header that web pages on other sites cannot send.
+Because face data is biometric, the server only answers requests for localhost
+(unless it listens on the network with --host 0.0.0.0), every change must carry a
+header that web pages on other sites cannot send, and every page and request needs
+you to be signed in as admin (web_auth.py; the first visit chooses the password).
 """
 from __future__ import annotations
 
@@ -37,12 +39,13 @@ from pathlib import Path
 
 import numpy as np
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from PIL import Image, ImageDraw, ImageOps
 
 import sort_photos as sp
+import web_auth
 
 log = sp.log
 
@@ -53,6 +56,9 @@ MAX_FACE_IDS = 5000
 SQL_CHUNK = 400
 SIMILAR_MIN = 0.30        # people whose faces look at least this alike are offered as "might be the same person"
 CONTEXT_MAX_SIDE = 1400
+SIGN_IN_PATHS = {"/login", "/api/auth/state", "/api/auth/login", "/api/auth/setup", "/api/auth/logout"}
+MAX_WRONG_PASSWORDS = 10  # per address within WRONG_PASSWORD_WINDOW seconds, then sign-in waits
+WRONG_PASSWORD_WINDOW = 600
 
 SCOPES = {
     "members": "fp.status IN ('auto', 'confirmed')",
@@ -157,11 +163,21 @@ class MergeBody(BaseModel):
     into: int
 
 
+class SetupBody(BaseModel):
+    password: str = Field(max_length=web_auth.MAX_LENGTH + 1)
+
+
+class SignInBody(BaseModel):
+    username: str = Field(max_length=200)
+    password: str = Field(max_length=web_auth.MAX_LENGTH + 1)
+
+
 # --------------------------------------------------------------------------
 # App
 # --------------------------------------------------------------------------
 def create_app(db_path: Path, allowed_hosts: set[str] | None = None, any_host: bool = False,
-               model_root: Path | None = None, job_command: list[str] | None = None) -> FastAPI:
+               model_root: Path | None = None, job_command: list[str] | None = None, login: bool = False) -> FastAPI:
+    """login=True (what 'ui' always uses) asks for the admin password; the tests of the other pages leave it off."""
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
         yield
@@ -183,6 +199,11 @@ def create_app(db_path: Path, allowed_hosts: set[str] | None = None, any_host: b
             return JSONResponse({"detail": "This address is not allowed. Use http://127.0.0.1:8765"}, status_code=403)
         if request.method not in ("GET", "HEAD") and request.headers.get("x-photo-sorter") != "1":
             return JSONResponse({"detail": "Missing request header."}, status_code=403)
+        path = request.url.path
+        if login and path not in SIGN_IN_PATHS and not path.startswith("/web/") and not signed_in(request):
+            if path.startswith("/api/"):
+                return JSONResponse({"detail": "Please sign in."}, status_code=401)
+            return RedirectResponse("/login", status_code=303)
         response = await call_next(request)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
@@ -197,6 +218,66 @@ def create_app(db_path: Path, allowed_hosts: set[str] | None = None, any_host: b
 
     def changed() -> None:
         app.state.version += 1
+
+    # ---------------------------------------------------------------- sign-in (web_auth.py)
+    app.state.wrong_passwords = {}        # address -> times of recent wrong passwords
+
+    def signed_in(request: Request) -> bool:
+        return web_auth.token_ok(web_auth.load(app.state.db_path), request.cookies.get(web_auth.COOKIE))
+
+    def start_session(response: Response) -> None:
+        token = web_auth.make_token(web_auth.load(app.state.db_path))
+        response.set_cookie(web_auth.COOKIE, token, max_age=web_auth.SESSION_DAYS * 86400, httponly=True, samesite="strict", path="/")
+
+    if login:
+        @app.get("/login", include_in_schema=False)
+        def login_page(request: Request):
+            if signed_in(request):
+                return RedirectResponse("/", status_code=303)
+            return FileResponse(WEB_DIR / "login.html", headers={"Cache-Control": "no-cache"})
+
+        @app.get("/api/auth/state")
+        def auth_state(request: Request):
+            return {"user": web_auth.USERNAME, "password_set": web_auth.load(app.state.db_path) is not None,
+                    "signed_in": signed_in(request), "min_length": web_auth.MIN_LENGTH}
+
+        @app.post("/api/auth/setup")
+        def auth_setup(body: SetupBody, response: Response):
+            problem = web_auth.problem_with(body.password)
+            if problem:
+                raise HTTPException(400, problem)
+            conn = connect(app.state.db_path)
+            try:
+                if not web_auth.set_first_password(conn, body.password):
+                    raise HTTPException(409, "A password is already set. Sign in with it instead.")
+            finally:
+                conn.close()
+            log.info("The web interface password was set from the web page.")
+            start_session(response)
+            return {"ok": True}
+
+        @app.post("/api/auth/login")
+        def auth_login(body: SignInBody, request: Request, response: Response):
+            address = request.client.host if request.client else "?"
+            recent = [t for t in app.state.wrong_passwords.get(address, []) if t > datetime.now().timestamp() - WRONG_PASSWORD_WINDOW]
+            app.state.wrong_passwords[address] = recent
+            if len(recent) >= MAX_WRONG_PASSWORDS:
+                raise HTTPException(429, "Too many wrong passwords. Wait ten minutes, then try again.")
+            stored = web_auth.load(app.state.db_path)
+            if stored is None:
+                raise HTTPException(409, "No password is set yet. Reload the page to choose one.")
+            if body.username.strip().lower() != web_auth.USERNAME or not web_auth.password_matches(body.password, stored["password"]):
+                recent.append(datetime.now().timestamp())
+                log.warning("Wrong username or password from %s.", address)
+                raise HTTPException(401, "Wrong username or password.")
+            recent.clear()
+            start_session(response)
+            return {"ok": True}
+
+        @app.post("/api/auth/logout")
+        def auth_logout(response: Response):
+            response.delete_cookie(web_auth.COOKIE, path="/", httponly=True, samesite="strict")
+            return {"ok": True}
 
     # ---------------------------------------------------------------- pages
     @app.get("/", include_in_schema=False)
@@ -692,6 +773,17 @@ def render_context(path: Path, box: tuple, others: list[tuple]) -> bytes:
 # --------------------------------------------------------------------------
 # Command
 # --------------------------------------------------------------------------
+def network_address() -> str | None:
+    """This computer's address on the local network (no packet is sent), or None."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("192.0.2.1", 9))
+            address = probe.getsockname()[0]
+    except OSError:
+        return None
+    return None if address.startswith(("127.", "0.")) else address
+
+
 def run_ui(args) -> int:
     db_path = (args.db or sp.default_db_path()).resolve()
     sp.log_index_location(db_path, True)
@@ -710,11 +802,14 @@ def run_ui(args) -> int:
         return 2
 
     loopback = args.host in LOOPBACK_HOSTS
-    if not loopback:
+    if web_auth.load(db_path) is None:
         log.warning(
-            "Listening on %s: anyone who can reach this computer on the network can see and change your face data. "
-            "There is no password. Use the default 127.0.0.1 unless you know what you are doing.", args.host,
+            "No password is set yet, so the first person to open the web page chooses it (user %s). "
+            "Open it now, or set it here first with: python sort_photos.py password", web_auth.USERNAME,
         )
+    if not loopback:
+        log.info("Listening on %s: other computers on your network can open it after signing in. "
+                 "Allow port %d in the firewall for them.", args.host, args.port)
     probe = socket.socket(socket.AF_INET6 if ":" in args.host else socket.AF_INET, socket.SOCK_STREAM)
     if sys.platform != "win32":  # same as uvicorn: a port in TIME_WAIT after a restart is not "in use"
         probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -726,10 +821,14 @@ def run_ui(args) -> int:
     finally:
         probe.close()
 
-    app = create_app(db_path, allowed_hosts={args.host}, any_host=not loopback and args.host in ("0.0.0.0", "::"))
+    app = create_app(db_path, allowed_hosts={args.host}, any_host=not loopback and args.host in ("0.0.0.0", "::"), login=True)
     shown = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
     url = f"http://{shown}:{args.port}"
     log.info("Web interface: %s  (press Ctrl+C to stop)", url)
+    if args.host in ("0.0.0.0", "::"):
+        address = network_address()
+        if address:
+            log.info("From other computers on your network: http://%s:%d", address, args.port)
     if not args.no_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     try:

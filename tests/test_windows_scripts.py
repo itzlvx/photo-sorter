@@ -105,10 +105,10 @@ def test_every_script_file_parses():
 # ===================================================================== menu.py
 def test_menu_quit_eof_and_bad_choices(box):
     r = box.run("menu.py", stdin="q\n")
-    assert r.returncode == 0 and "1) Start the web interface" in r.stdout and "3) Find faces" in r.stdout and "4) Read camera details" in r.stdout and "5) Prepare search" in r.stdout and "6) Check a search model" in r.stdout
+    assert r.returncode == 0 and "1) Start the web interface" in r.stdout and "3) Find faces" in r.stdout and "4) Read camera details" in r.stdout and "5) Prepare search" in r.stdout and "6) Check a search model" in r.stdout and "7) Reset the web interface password" in r.stdout
     assert box.run("menu.py", stdin="").returncode == 0
     r = box.run("menu.py", stdin="9\nhello\n\nQ\n")
-    assert r.stderr.count("Please type 1, 2, 3, 4, 5, 6 or q.") == 2 and box.calls() == []
+    assert r.stderr.count("Please type 1, 2, 3, 4, 5, 6, 7 or q.") == 2 and box.calls() == []
 
 
 def test_menu_help_and_unknown_argument(box):
@@ -126,6 +126,26 @@ def test_menu_choice_runs_the_action_then_returns(box):
 def test_ui_direct_with_database_and_options(box, word, tmp_path):
     box.run("menu.py", word, PHOTO_SORTER_DB=tmp_path / "my index.db", PHOTO_SORTER_UI_ARGS="--port 9000 --no-browser")
     assert box.calls() == [f"ui --db {tmp_path / 'my index.db'} --port 9000 --no-browser"]
+
+
+@pytest.mark.parametrize("word", ["password", "7"])
+def test_password_option_resets_it(box, word, tmp_path):
+    r = box.run("menu.py", word, PHOTO_SORTER_DB=tmp_path / "i.db")
+    assert r.returncode == 0 and box.calls() == [f"password --db {tmp_path / 'i.db'}"] and "Done." in r.stdout
+    box.log.unlink()
+    r = box.run("menu.py", "password", FAKE_RC_password=1)
+    assert r.returncode == 1 and "Nothing was changed" in r.stdout
+    r = box.run("menu.py", "password", FAKE_RC_password=2)
+    assert r.returncode == 2 and "could not be changed" in r.stderr
+    box.log.unlink()
+    r = box.run("menu.py", stdin=answers("7", "", "q"))
+    assert r.returncode == 0 and box.calls() == ["password"]
+
+
+def test_launcher_listens_on_the_network_unless_told_otherwise():
+    text = (ROOT / "photo-sorter.bat").read_text(encoding="ascii")
+    assert 'if not defined PHOTO_SORTER_UI_ARGS set "PHOTO_SORTER_UI_ARGS=--host 0.0.0.0"' in text
+    assert text.lower().index("setlocal") < text.index("PHOTO_SORTER_UI_ARGS=")
 
 
 def test_ui_exit_code_is_passed_on(box):

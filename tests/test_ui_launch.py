@@ -41,7 +41,7 @@ def test_starts_on_loopback_by_default(env, cli, started, face_index):
     r = run(cli, port=port)
     assert r.code == 0 and started["host"] == "127.0.0.1" and started["port"] == port
     assert f"http://127.0.0.1:{port}" in r.out and "stopped" in r.out
-    assert "no password" not in r.err
+    assert "Listening on" not in r.text and "other computers" not in r.text
 
 
 def test_a_port_in_use_is_reported_with_a_suggestion(env, cli, started, face_index):
@@ -54,12 +54,33 @@ def test_a_port_in_use_is_reported_with_a_suggestion(env, cli, started, face_ind
     assert r.code == 2 and "Cannot use port" in r.err and f"--port {port + 1}" in r.err and not started
 
 
-def test_listening_on_the_network_warns_loudly_and_accepts_any_host(env, cli, started, face_index):
+def test_listening_on_the_network_accepts_any_host_but_needs_signing_in(env, cli, started, face_index, monkeypatch):
     face_index(5)
+    monkeypatch.setattr(ui_server, "network_address", lambda: "192.168.68.80")
     r = run(cli, "--host", "0.0.0.0")
-    assert "no password" in r.err.lower() and started["host"] == "0.0.0.0"
+    assert started["host"] == "0.0.0.0" and "Listening on 0.0.0.0" in r.out and "firewall" in r.out
+    assert "From other computers on your network: http://192.168.68.80:" in r.out
     from fastapi.testclient import TestClient
-    assert TestClient(started["app"], base_url="http://nas.local").get("/api/summary").status_code == 200
+    client = TestClient(started["app"], base_url="http://nas.local")
+    assert client.get("/api/summary").status_code == 401
+    assert client.post("/api/auth/setup", json={"password": "correct horse"}, headers={"X-Photo-Sorter": "1"}).status_code == 200
+    assert client.get("/api/summary").status_code == 200
+
+
+def test_starting_without_a_password_says_how_to_set_one(env, cli, started, face_index):
+    face_index(5)
+    r = run(cli)
+    assert "No password is set yet" in r.err and "sort_photos.py password" in r.err
+    import web_auth
+    conn = sp.open_index(env.db)
+    web_auth.set_password(conn, "correct horse")
+    conn.close()
+    assert "No password" not in run(cli).err
+
+
+def test_network_address_is_a_local_address_or_nothing():
+    address = ui_server.network_address()
+    assert address is None or (address.count(".") == 3 and not address.startswith("127."))
 
 
 def test_loopback_server_refuses_foreign_host_names(env, cli, started, face_index):

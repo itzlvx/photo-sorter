@@ -1206,12 +1206,18 @@ def build_parser() -> argparse.ArgumentParser:
     metadata_cmd.add_argument("--reread", action="store_true", help="read every photo again, not only the ones without details")
 
     commands.add_parser("info", parents=[base], help="show where the index database is and what it contains")
+
+    password_cmd = commands.add_parser(
+        "password", parents=[base],
+        help="set the web interface password for the user admin (asks twice; signs every browser out)",
+    )
+    password_cmd.add_argument("--clear", action="store_true", help="remove the password instead: the web page then asks for a new one")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    if argv and argv[0] not in {"sort", "refresh", "info", "metadata", "faces", "gpucheck", "clipcheck", "embed", "cluster", "ui", "-h", "--help"}:
+    if argv and argv[0] not in {"sort", "refresh", "info", "metadata", "faces", "gpucheck", "clipcheck", "embed", "cluster", "ui", "password", "-h", "--help"}:
         argv = ["sort", *argv]  # keep the original "sort_photos.py SOURCE DEST" form working
     args = build_parser().parse_args(argv)
     setup_logging(args.verbose, args.log_file)
@@ -1221,6 +1227,9 @@ def main(argv: list[str] | None = None) -> int:
         return show_info(args)
     if args.command == "metadata":
         return read_metadata(args)
+    if args.command == "password":
+        import web_auth  # standard library only
+        return web_auth.password_command(args)
     if args.command == "ui":
         try:
             import ui_server  # needs fastapi + uvicorn

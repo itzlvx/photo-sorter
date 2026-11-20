@@ -27,6 +27,15 @@ class ApiError extends Error {
   constructor(message, status, data) { super(message); this.status = status; this.data = data; }
 }
 
+function toSignIn() {
+  location.replace("/login" + (location.hash.startsWith("#/") ? "?next=" + encodeURIComponent(location.hash) : ""));
+}
+
+async function signOut() {
+  try { await fetch("/api/auth/logout", { method: "POST", headers: { "X-Photo-Sorter": "1" } }); } catch { /* signed out anyway below */ }
+  location.replace("/login");
+}
+
 async function api(path, options = {}) {
   const init = { method: "GET", headers: {} };
   if (options.body !== undefined) {
@@ -38,6 +47,10 @@ async function api(path, options = {}) {
   let response;
   try { response = await fetch(path, init); }
   catch { throw new ApiError("Can't reach the photo sorter. Check that the window running it is still open.", 0); }
+  if (response.status === 401) {          // signed out (or the password was reset): sign in, then come back here
+    toSignIn();
+    return new Promise(() => {});
+  }
   let data = null;
   try { data = await response.json(); } catch { /* not JSON */ }
   if (!response.ok) {
@@ -186,6 +199,7 @@ function renderRail() {
   const foot = h("div", { class: "rail-foot" },
     s.ungrouped > 0 ? h("p", { class: "rail-note", text: `${plural(s.ungrouped, "new face")} not grouped yet.` }) : null,
     h("button", { class: "btn" + (s.ungrouped > 0 ? " primary" : ""), type: "button", text: "Place new faces", onclick: regroup }),
+    h("button", { class: "btn quiet rail-signout", type: "button", text: "Sign out", onclick: signOut }),
   );
   rail.replaceChildren(
     h("div", { class: "brand", text: "Photo sorter" }),

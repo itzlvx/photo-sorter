@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · Photo sorter</title>
+  <meta name="color-scheme" content="light dark">
+  <link rel="stylesheet" href="/web/style.css">
+</head>
+<body class="login-body">
+  <main class="login">
+    <div class="brand">Photo sorter</div>
+    <form class="login-card" id="form" novalidate hidden>
+      <h1 id="title">Sign in</h1>
+      <p class="login-intro" id="intro"></p>
+      <label class="task-field">
+        <span class="lbl">Username</span>
+        <input class="field" id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+      </label>
+      <label class="task-field">
+        <span class="lbl">Password</span>
+        <input class="field" id="password" name="password" type="password" required>
+      </label>
+      <label class="task-field" id="repeat-field" hidden>
+        <span class="lbl">Type it again</span>
+        <input class="field" id="repeat" name="repeat" type="password" autocomplete="new-password">
+      </label>
+      <p class="login-error" id="error" role="alert" hidden></p>
+      <button class="btn primary" id="submit" type="submit">Sign in</button>
+      <p class="login-hint" id="hint"></p>
+    </form>
+    <noscript><p>The photo sorter needs JavaScript.</p></noscript>
+  </main>
+  <script src="/web/login.js"></script>
+</body>
+</html>

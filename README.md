@@ -194,6 +194,14 @@ are. If many faces land in `review`, check a few groups in the UI, adjust the op
 Keep the `web` folder next to `ui_server.py`. Close the window running the command (or press Ctrl+C) to stop it.
 Everything stays on this computer: the page only talks to this program, and the program only talks to the index.
 
+**Signing in.** The web interface has one user, **admin**. The first time it is opened, the page asks you to choose
+the password (at least 8 characters); after that every browser signs in with it, and stays signed in for 30 days or
+until **Sign out** (bottom left). Forgot it? On the computer running the photo sorter, choose **7) Reset the web
+interface password** in `photo-sorter.bat` (or run `python sort_photos.py password`): it asks for a new one and
+signs every browser out. `python sort_photos.py password --clear` removes it instead, so the page asks again. The
+password is kept in the index as a salted PBKDF2 hash, so copying the index to another computer takes it along. After
+10 wrong passwords from one address, signing in from there waits ten minutes.
+
 When you open it, you land in **Review** if the AI has questions for you, otherwise in **People**.
 
 - **People:** one contact strip per person (four faces, so a wrong group is obvious at a glance). Type a name under the
@@ -216,10 +224,14 @@ Your decisions are protected: named people, merged people, confirmed faces and i
 are removed. There is no undo button; to reverse a move, move the faces back.
 
 Privacy and safety:
-- It only answers requests for `127.0.0.1` / `localhost`, and every change needs a header that other websites can't
-  send, so a web page you visit can't read or change your face data.
-- `--host 0.0.0.0` would expose it to your network **with no password**; the program warns you. Don't, unless you
-  trust everyone on that network.
+- Every page and request needs you to be signed in, and every change needs a header that other websites can't send,
+  so a web page you visit can't read or change your face data.
+- By default it only answers on this computer (`127.0.0.1`). `--host 0.0.0.0` lets other computers on your network
+  open it (they still need the password; the program prints the address to use). Windows Firewall also has to allow
+  the port, for example in an administrator PowerShell:
+  `New-NetFirewallRule -DisplayName "Photo sorter (8765)" -Direction Inbound -Protocol TCP -LocalPort 8765 -Action Allow -Profile Private -RemoteAddress 192.168.68.0/22`
+  (use your own network's range; "LocalSubnet" did not cover every machine on a mesh network). It is plain HTTP, so
+  keep it inside your home network: don't forward the port on your router.
 - `--port` changes the port (default 8765), `--no-browser` stops it opening a browser tab.
 
 ### Phase 5: browse the whole library (the **Photos** page)
@@ -417,9 +429,14 @@ older PC stay as they are). It only ever fast-forwards: if you changed files or 
 can't be reached, it says so and starts the version you have. Set `PHOTO_SORTER_NO_UPDATE=1` to skip the check. A
 folder made with `deploy.bat` or from a zip download is not a git checkout and is never updated this way.
 
+**`photo-sorter.bat` opens the web interface to your network.** Option 1 starts it with `--host 0.0.0.0`, so other
+computers can open it after signing in (see Signing in above, and allow the port in the firewall). To keep it to this
+computer, set `PHOTO_SORTER_UI_ARGS` yourself, for example `setx PHOTO_SORTER_UI_ARGS "--host 127.0.0.1"`; whatever
+you set there is used instead.
+
 | Script | What it does |
 |---|---|
-| `photo-sorter.bat` / `./photo-sorter.sh` | Menu: **1** start the web interface, **2** intake and sort photos (asks where they are, shows a preview, then asks before changing anything), **3** find faces and group people (refresh the index, scan for faces, group them), **4** read camera details (preview, then asks; can read every photo again), **5** prepare search (asks which model, shows a preview, offers to download the model if it is missing, then stores the search vectors), **6** check a search model (shows the suggested models, checks and times the one you pick, downloads it only after asking; a model that passes becomes the default for 5). Also `photo-sorter.bat ui`, `sort`, `faces`, `metadata`, `search`, `clipcheck`. Your last folders and search model are remembered in `.photo-sorter.conf`. |
+| `photo-sorter.bat` / `./photo-sorter.sh` | Menu: **1** start the web interface, **2** intake and sort photos (asks where they are, shows a preview, then asks before changing anything), **3** find faces and group people (refresh the index, scan for faces, group them), **4** read camera details (preview, then asks; can read every photo again), **5** prepare search (asks which model, shows a preview, offers to download the model if it is missing, then stores the search vectors), **6** check a search model (shows the suggested models, checks and times the one you pick, downloads it only after asking; a model that passes becomes the default for 5), **7** reset the web interface password (asks for a new one; every browser is signed out). Also `photo-sorter.bat ui`, `sort`, `faces`, `metadata`, `search`, `clipcheck`, `password`. Your last folders and search model are remembered in `.photo-sorter.conf`. |
 | `run-tests.bat` / `./run-tests.sh` | Syntax checks plus all tests (`--all` adds the browser tests, `--cov` shows what is not covered, `--install` installs the test tools first, `-k word` runs matching tests only). Exit code 0 means everything passed. |
 | `deploy.bat` / `./deploy.sh` | Runs the tests, then copies the program files to the production folder, keeping dated backups. `--dry-run` shows what would happen, `--rollback` restores the previous version. It never touches the database, thumbnails, `.photo-sorter.conf` or a virtual environment in production. |
 

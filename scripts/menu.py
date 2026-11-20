@@ -7,6 +7,7 @@
   photo-sorter.bat metadata read camera details for indexed photos (also: 4)
   photo-sorter.bat search   store search vectors for indexed photos (also: 5)
   photo-sorter.bat clipcheck check (and download) a search model  (also: 6)
+  photo-sorter.bat password  reset the web interface password      (also: 7)
 
 Settings (all optional): PHOTO_SORTER_PYTHON, PHOTO_SORTER_DB, PHOTO_SORTER_UI_ARGS, PHOTO_SORTER_FACES_ARGS.
 """
@@ -44,7 +45,8 @@ def action_ui():
     header("Start the web interface")
     if not ensure_modules("The web interface", "requirements-ui.txt", "fastapi", "uvicorn"):
         return 1
-    say("It opens in your browser, normally at http://127.0.0.1:8765. Press Ctrl+C here to stop it.")
+    say("It opens in your browser, normally at http://127.0.0.1:8765. Sign in as admin (the first visit chooses the password).")
+    say("Press Ctrl+C here to stop it.")
     return run_py("ui", *DB_ARGS, *extra("PHOTO_SORTER_UI_ARGS"))
 
 
@@ -234,14 +236,28 @@ def action_clipcheck():
     return rc
 
 
+def action_password():
+    header("Reset the web interface password")
+    say("Sets a new password for the web interface user admin. Every browser that is signed in is signed out.")
+    say("Nothing is shown while you type. Leave it empty to cancel.")
+    rc = run_py("password", *DB_ARGS)
+    if rc == 0:
+        ok("Done. Sign in with the new password (a running web interface uses it straight away).")
+    elif rc == 1:
+        say("Nothing was changed.")
+    else:
+        fail("The password could not be changed (see above).")
+    return rc
+
+
 ACTIONS = {"1": action_ui, "ui": action_ui, "2": action_sort, "sort": action_sort, "3": action_faces, "faces": action_faces,
            "4": action_metadata, "metadata": action_metadata, "5": action_search, "search": action_search,
-           "6": action_clipcheck, "clipcheck": action_clipcheck}
+           "6": action_clipcheck, "clipcheck": action_clipcheck, "7": action_password, "password": action_password}
 
 
 def menu():
     while True:
-        print("\nPhoto sorter\n 1) Start the web interface\n 2) Intake and sort photos\n 3) Find faces and group people (refresh)\n 4) Read camera details\n 5) Prepare search (search vectors)\n 6) Check a search model\n q) Quit")
+        print("\nPhoto sorter\n 1) Start the web interface\n 2) Intake and sort photos\n 3) Find faces and group people (refresh)\n 4) Read camera details\n 5) Prepare search (search vectors)\n 6) Check a search model\n 7) Reset the web interface password\n q) Quit")
         choice = ask("Choose: ")
         if choice is None:
             return 0
@@ -255,7 +271,7 @@ def menu():
         elif choice in ("q", "quit", "exit"):
             return 0
         elif choice:
-            warn("Please type 1, 2, 3, 4, 5, 6 or q.")
+            warn("Please type 1, 2, 3, 4, 5, 6, 7 or q.")
 
 
 def main(argv):

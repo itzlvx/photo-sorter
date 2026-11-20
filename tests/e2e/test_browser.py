@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from browser_fixtures import browser, page, site  # noqa: F401,E402  (fixtures)
+from browser_fixtures import browser, new_site, page, site  # noqa: F401,E402  (fixtures)
 
 pytestmark = pytest.mark.e2e
 
@@ -241,6 +241,7 @@ def test_people_and_review_pages_load(page, site):
 
 def test_phone_width_has_no_sideways_scroll(browser, site):
     context = browser.new_context(viewport={"width": 390, "height": 800}, is_mobile=True)
+    site.sign_in(context)
     page = context.new_page()
     for route in ("photos", "people", "review", "tasks"):
         page.goto(f"{site.url}/#/{route}")
@@ -256,7 +257,7 @@ def test_tasks_page_chooses_folders_previews_then_sorts(page, site, tmp_path):
         make_photo(incoming / f"new{i}.jpg", seed=500 + i, taken=f"2019:07:0{i + 1} 09:00:00")
     before = len(files(site))
     urllib.request.urlopen(urllib.request.Request(f"{site.url}/api/library/root", data=json.dumps({"path": str(site.library)}).encode(),
-                                                  headers={"Content-Type": "application/json", "X-Photo-Sorter": "1"})).read()
+                                                  headers={"Content-Type": "application/json", "X-Photo-Sorter": "1", "Cookie": site.cookie})).read()
     page.goto(f"{site.url}/#/tasks")
     page.get_by_role("heading", name="Sort new photos").wait_for()
 
@@ -299,3 +300,44 @@ def test_change_the_photo_library_then_add_it(page, site, tmp_path):
     page.get_by_role("link", name="See the photos").wait_for(timeout=60000)
     assert "Added to index:" in page.locator("pre.log").inner_text()
     page.wait_for_function("document.querySelector('.library-card .lib-stats b')?.textContent === '3'")
+
+
+def test_first_visit_chooses_the_password_then_sign_out_and_in(browser, new_site):
+    context = browser.new_context(viewport={"width": 1360, "height": 900})
+    page = context.new_page()
+    errors = []
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    page.goto(f"{new_site.url}/#/photos")
+    page.get_by_role("heading", name="Choose a password").wait_for()
+    assert page.get_by_label("Username").input_value() == "admin"
+    page.get_by_label("Password", exact=True).fill("first password")
+    page.get_by_label("Type it again").fill("first passwrod")
+    page.get_by_role("button", name="Set password and open").click()
+    page.get_by_text("The two passwords are different.").wait_for()
+    page.get_by_label("Type it again").fill("first password")
+    page.get_by_role("button", name="Set password and open").click()
+    page.wait_for_url(f"{new_site.url}/#/photos")                         # back where it started
+    page.get_by_role("button", name="Sign out").click()
+    page.get_by_role("heading", name="Sign in").wait_for()
+    page.get_by_label("Password", exact=True).fill("not the password")
+    page.get_by_role("button", name="Sign in").click()
+    page.get_by_text("Wrong username or password.").wait_for()
+    page.get_by_label("Password", exact=True).fill("first password")
+    page.get_by_role("button", name="Sign in").click()
+    page.get_by_role("link", name="Photos").wait_for()
+    context.clear_cookies()                                                  # the session ends (password reset, 30 days)
+    page.evaluate("location.hash = '#/review'")                              # the next request sends it to sign in ...
+    page.get_by_role("heading", name="Sign in").wait_for()
+    assert "next=%23%2Freview" in page.url
+    page.get_by_label("Password", exact=True).fill("first password")
+    page.get_by_role("button", name="Sign in").click()
+    page.wait_for_url(f"{new_site.url}/#/review")                          # ... and back afterwards
+    other = browser.new_context().new_page()                                 # another browser is not signed in
+    other.goto(f"{new_site.url}/#/people")
+    other.get_by_role("heading", name="Sign in").wait_for()
+    other.get_by_label("Password", exact=True).fill("first password")
+    other.get_by_role("button", name="Sign in").click()
+    other.wait_for_url(f"{new_site.url}/#/people")
+    other.context.close()
+    context.close()
+    assert errors == []
