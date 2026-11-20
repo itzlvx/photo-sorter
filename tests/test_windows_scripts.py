@@ -563,3 +563,123 @@ def test_rollback(box, tmp_path):
     assert r.returncode == 0 and "Rolled back" in r.stdout
     assert (target / "README.md").read_text(encoding="utf-8") == v1 and not (target / "new_in_v2.py").exists()
     assert (target / "photo_index.db").read_bytes() == b"data" and any(Path(f"{target}-backups").iterdir())
+
+
+# ===================================================================== self-update.bat (Windows with git only)
+needs_cmd_and_git = pytest.mark.skipif(os.name != "nt" or shutil.which("git") is None, reason="runs the real .bat files with cmd and git")
+
+FAKE_MENU = 'import sys\nprint("menu VERSION", " ".join(sys.argv[1:]))\n'
+
+
+class Upstream:
+    """A local stand-in for GitHub (a bare repo) plus a clone of it, holding the real launchers and a fake menu."""
+
+    def __init__(self, tmp: Path):
+        self.tmp = tmp
+        self.origin = tmp / "origin.git"
+        self.work = tmp / "upstream-work"
+        self.clone = tmp / "my copy"
+        self.git(None, "init", "--bare", "-b", "main", str(self.origin))
+        self.git(None, "clone", str(self.origin), str(self.work))
+        (self.work / "scripts").mkdir()
+        for rel in ("photo-sorter.bat", "scripts/self-update.bat", "scripts/find-python.bat", "scripts/pycheck.py"):
+            shutil.copyfile(ROOT / rel, self.work / rel)
+        (self.work / ".gitattributes").write_text("*.bat -text\n", encoding="utf-8")
+        self.publish("first", {"scripts/menu.py": FAKE_MENU.replace("VERSION", "v1"), "requirements-ui.txt": "fastapi\n"})
+        self.git(None, "clone", str(self.origin), str(self.clone))
+
+    def git(self, where, *args):
+        cmd = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "core.autocrlf=false", "-c", "init.defaultBranch=main"]
+        cmd += (["-C", str(where)] if where else []) + list(args)
+        return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+
+    def publish(self, message, files):
+        for rel, text in files.items():
+            (self.work / rel).write_bytes(text.encode("utf-8"))
+        self.git(self.work, "add", "-A")
+        self.git(self.work, "commit", "-q", "-m", message)
+        self.git(self.work, "push", "-q", "origin", "main")
+
+    def run(self, bat, *args, **env):
+        environ = {**os.environ, "PHOTO_SORTER_PYTHON": f'"{sys.executable}"', **env}
+        for name in ("PHOTO_SORTER_NO_UPDATE", "PHOTO_SORTER_UPDATED"):
+            if name not in env:
+                environ.pop(name, None)
+        return subprocess.run(["cmd", "/d", "/c", str(self.clone / bat), *args], capture_output=True, text=True, env=environ, timeout=120)
+
+    def head(self):
+        return self.git(self.clone, "rev-parse", "HEAD").strip()
+
+
+@pytest.fixture
+def upstream(tmp_path):
+    return Upstream(tmp_path)
+
+
+@needs_cmd_and_git
+def test_launcher_updates_then_starts_the_new_version(upstream):
+    r = upstream.run("photo-sorter.bat", "q")
+    assert r.returncode == 0 and "Already up to date" in r.stdout and "menu v1 q" in r.stdout
+    longer = (ROOT / "photo-sorter.bat").read_text(encoding="ascii").replace("@echo off\n", "@echo off\nrem " + "x" * 300 + "\n", 1)
+    upstream.publish("second", {"scripts/menu.py": FAKE_MENU.replace("VERSION", "v2"), "requirements-ui.txt": "fastapi\nnumpy\n",
+                                "photo-sorter.bat": longer.replace("\r\n", "\n").replace("\n", "\r\n")})
+    r = upstream.run("photo-sorter.bat", "q")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "Updated to the latest version" in r.stdout and "second" in r.stdout
+    assert "requirements-ui.txt changed" in r.stdout
+    assert r.stdout.count("menu v2 q") == 1 and "menu v1" not in r.stdout       # restarted once, from the new copy
+    assert upstream.run("photo-sorter.bat", "q").stdout.count("Already up to date") == 1
+
+
+@needs_cmd_and_git
+def test_menu_exit_code_still_comes_through(upstream):
+    upstream.publish("fails", {"scripts/menu.py": "import sys\nsys.exit(4)\n"})
+    assert upstream.run("photo-sorter.bat").returncode == 4
+    assert upstream.run("photo-sorter.bat").returncode == 4
+
+
+@needs_cmd_and_git
+def test_update_can_be_turned_off(upstream):
+    upstream.publish("second", {"scripts/menu.py": FAKE_MENU.replace("VERSION", "v2")})
+    r = upstream.run("photo-sorter.bat", PHOTO_SORTER_NO_UPDATE="1")
+    assert "Checking GitHub" not in r.stdout and "menu v1" in r.stdout
+
+
+@needs_cmd_and_git
+def test_local_changes_and_local_commits_are_never_touched(upstream):
+    upstream.publish("second", {"scripts/menu.py": FAKE_MENU.replace("VERSION", "v2")})
+    before = upstream.head()
+    (upstream.clone / "requirements-ui.txt").write_text("my own edit\n", encoding="utf-8")
+    r = upstream.run("scripts/self-update.bat")
+    assert r.returncode == 0 and "files in this copy were changed" in r.stdout and upstream.head() == before
+    assert (upstream.clone / "requirements-ui.txt").read_text(encoding="utf-8") == "my own edit\n"
+
+    upstream.git(upstream.clone, "commit", "-q", "-am", "mine")
+    mine = upstream.head()
+    r = upstream.run("scripts/self-update.bat")
+    assert r.returncode == 0 and "its own commits" in r.stdout and upstream.head() == mine
+
+
+@needs_cmd_and_git
+def test_other_branch_no_network_and_no_git_checkout_are_skipped(upstream):
+    upstream.git(upstream.clone, "checkout", "-q", "-b", "trying-something")
+    r = upstream.run("scripts/self-update.bat")
+    assert r.returncode == 0 and 'branch "trying-something"' in r.stdout
+    upstream.git(upstream.clone, "checkout", "-q", "main")
+
+    upstream.git(upstream.clone, "remote", "set-url", "origin", str(upstream.tmp / "gone.git"))
+    r = upstream.run("photo-sorter.bat", "q")
+    assert r.returncode == 0 and "Could not reach GitHub" in r.stdout and "menu v1 q" in r.stdout
+
+    shutil.rmtree(upstream.clone / ".git", onerror=lambda f, p, e: (os.chmod(p, 0o700), f(p)))
+    r = upstream.run("photo-sorter.bat", "q")
+    assert r.returncode == 0 and "Checking GitHub" not in r.stdout and "menu v1 q" in r.stdout
+
+
+def test_self_update_batch_file_is_consistent():
+    data = (ROOT / "scripts" / "self-update.bat").read_bytes()
+    assert data.count(b"\r\n") == data.count(b"\n") > 10
+    text = data.decode("ascii")
+    assert "--ff-only" in text and "PHOTO_SORTER_NO_UPDATE" in text and "exit /b 3" in text
+    launcher = (ROOT / "photo-sorter.bat").read_text(encoding="ascii")
+    assert "self-update.bat" in launcher and "PHOTO_SORTER_UPDATED" in launcher

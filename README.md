@@ -132,6 +132,10 @@ Good to know:
   as far as I can tell, a GTX 16-series / RTX 20-series or newer card (CUDA 13 dropped support for
   Pascal and older, such as the GTX 10-series). For an older card or driver, use the CUDA 12 build
   instead, replacing the last command above with: `pip install "onnxruntime-gpu[cuda,cudnn]==1.26.0"`.
+- GTX 10-series (Pascal) and older also need an older cuDNN: cuDNN 9.9 and later dropped those
+  cards. The symptom is `gpucheck` loading the models on the GPU and then failing with
+  `CUDNN_STATUS_EXECUTION_FAILED_CUDART` or `cudnn_engines_... .dll` errors. After the CUDA 12
+  command above, also run: `pip install "nvidia-cudnn-cu12<9.9"`. A newer driver alone does not fix it.
 - Windows wheels exist for Python 3.11 and 3.12.
 - With a GPU, a larger `--det-size` (for example 960) costs little and finds smaller faces in
   group photos. The scan reads photos in background threads, so a network drive is usually the
@@ -405,6 +409,13 @@ task that is still running.
 
 **On Windows, double-click or run the `.bat` files** (`photo-sorter.bat`, `run-tests.bat`, `deploy.bat`) from Command Prompt or PowerShell. They do the same as the `.sh` scripts below, which are for Git Bash, macOS and Linux. Both need Python 3.9 or newer;
 set `PHOTO_SORTER_PYTHON` (for example `py -3`) if the right one is not found automatically. Pressing Ctrl+C while the web interface runs stops it; if Windows then asks "Terminate batch job (Y/N)?", answer **Y** to leave or **N** to return to the menu.
+
+**`photo-sorter.bat` keeps itself up to date.** When the folder is a git checkout on the `main` branch, it first
+fetches `main` from GitHub and, if there is a newer version, updates to it and starts that one. It lists what changed
+and says when a `requirements*.txt` file changed (it does not install packages itself, so versions pinned for an
+older PC stay as they are). It only ever fast-forwards: if you changed files or made your own commits, or GitHub
+can't be reached, it says so and starts the version you have. Set `PHOTO_SORTER_NO_UPDATE=1` to skip the check. A
+folder made with `deploy.bat` or from a zip download is not a git checkout and is never updated this way.
 
 | Script | What it does |
 |---|---|
